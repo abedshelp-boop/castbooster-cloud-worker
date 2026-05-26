@@ -1,5 +1,6 @@
 # auth.py
 import os
+import secrets
 
 from fastapi import Header, HTTPException, status
 
@@ -21,7 +22,7 @@ async def require_api_key(authorization: str | None = Header(default=None)):
             detail="Missing or invalid Authorization header",
         )
     provided = authorization.removeprefix("Bearer ").strip()
-    if provided != expected_key:
+    if not secrets.compare_digest(provided, expected_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",

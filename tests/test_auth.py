@@ -1,5 +1,4 @@
 # tests/test_auth.py
-import os
 import pytest
 from fastapi.testclient import TestClient
 
@@ -30,3 +29,17 @@ def test_protected_accepts_correct_bearer(client):
 def test_healthz_does_not_require_bearer(client):
     response = client.get("/healthz")
     assert response.status_code == 200
+
+def test_protected_returns_500_when_api_key_unset(monkeypatch):
+    """When CLOUD_API_KEY is missing from the worker env, /_test_protected
+    must return 500 — not 401/403 — because the worker is misconfigured,
+    not the caller.
+    """
+    # Override the autouse set_api_key fixture by deleting after it set
+    monkeypatch.delenv("CLOUD_API_KEY", raising=False)
+    # Need a fresh client AFTER env mutation so the import-time check sees it
+    from server import app
+    client = TestClient(app)
+    response = client.get("/_test_protected", headers={"Authorization": "Bearer anything"})
+    assert response.status_code == 500
+    assert "CLOUD_API_KEY not configured" in response.json()["detail"]
