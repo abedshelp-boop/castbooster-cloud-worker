@@ -32,7 +32,7 @@ def test_process_starts_pipeline_and_returns_hls_url(client, monkeypatch):
 
     def fake_run_passthrough(**kwargs):
         fake_calls.append(kwargs)
-        from pipeline import PipelineResult
+        from pipeline_types import PipelineResult
         return PipelineResult(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("server.run_pipeline_for_request", fake_run_passthrough)
@@ -55,7 +55,7 @@ def test_process_starts_pipeline_and_returns_hls_url(client, monkeypatch):
 
 def test_process_returns_502_on_pipeline_failure(client, monkeypatch):
     def fake_run_passthrough(**kwargs):
-        from pipeline import PipelineResult
+        from pipeline_types import PipelineResult
         return PipelineResult(returncode=1, stdout="", stderr="ffmpeg error: bad source")
 
     monkeypatch.setattr("server.run_pipeline_for_request", fake_run_passthrough)

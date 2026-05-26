@@ -1,13 +1,7 @@
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
-
-@dataclass
-class PipelineResult:
-    returncode: int
-    stdout: str
-    stderr: str
+from pipeline_types import PipelineResult
 
 
 def run_passthrough(

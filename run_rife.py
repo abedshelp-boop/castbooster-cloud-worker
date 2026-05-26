@@ -5,15 +5,9 @@ This module runs only inside the cloud Docker image (GPU required).
 Local dev machines without GPU should use run_passthrough instead.
 """
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
-
-@dataclass
-class PipelineResult:
-    returncode: int
-    stdout: str
-    stderr: str
+from pipeline_types import PipelineResult
 
 
 # VapourSynth script template — interpolates 2x via RIFE v4.6
@@ -71,8 +65,14 @@ def run_rife(
                 raise ValueError(
                     f"header {k!r} contains CR/LF (injection attempt)"
                 )
-        header_lines = "".join(f"{k}: {v}\r\n" for k, v in extra_input_headers.items())
-        ffmpeg_cmd += ["-headers", header_lines]
+        # ffmpeg reads from stdin (vspipe pipeline), so its -headers flag is dead code here.
+        # Headers must be forwarded via lsmas's format_opts inside the VPY script.
+        # Tracked as Phase 2 backlog (see Task 26 / Crunchyroll DRM work).
+        raise NotImplementedError(
+            "extra_input_headers not supported in RIFE pipeline yet — "
+            "vapoursynth/lsmas reads the source, not ffmpeg. "
+            "Phase 2: thread headers via lsmas format_opts."
+        )
 
     ffmpeg_cmd += [
         "-f", "yuv4mpegpipe",
@@ -101,8 +101,17 @@ def run_rife(
 
     try:
         ffmpeg_stdout, ffmpeg_stderr = ffmpeg_proc.communicate(timeout=timeout_s)
-        vspipe_proc.wait(timeout=5)
+        try:
+            vspipe_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            print("[run_rife] vspipe didn't exit within 5s of ffmpeg completion; killing")
+            vspipe_proc.kill()
+            try:
+                vspipe_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
     except subprocess.TimeoutExpired:
+        # outer ffmpeg timeout
         ffmpeg_proc.kill()
         vspipe_proc.kill()
         return PipelineResult(
@@ -111,18 +120,25 @@ def run_rife(
             stderr=f"pipeline timeout after {timeout_s}s",
         )
 
-    if ffmpeg_proc.returncode != 0:
-        return PipelineResult(
-            returncode=ffmpeg_proc.returncode,
-            stdout=ffmpeg_stdout.decode(errors="replace"),
-            stderr=ffmpeg_stderr.decode(errors="replace"),
-        )
+    # Check vspipe first: it's the upstream of the pipe, so its failure mode
+    # (e.g. RIFE init crash, lsmas can't open source) usually explains
+    # whatever downstream ffmpeg error we'd otherwise show.
     if vspipe_proc.returncode != 0:
         vspipe_stderr = vspipe_proc.stderr.read().decode(errors="replace")
         return PipelineResult(
             returncode=vspipe_proc.returncode,
             stdout="",
-            stderr=f"vspipe failed: {vspipe_stderr}",
+            stderr=(
+                f"vspipe failed: {vspipe_stderr}\n"
+                f"(ffmpeg returncode={ffmpeg_proc.returncode}, "
+                f"ffmpeg stderr tail: {ffmpeg_stderr.decode(errors='replace')[-200:]})"
+            ),
+        )
+    if ffmpeg_proc.returncode != 0:
+        return PipelineResult(
+            returncode=ffmpeg_proc.returncode,
+            stdout=ffmpeg_stdout.decode(errors="replace"),
+            stderr=ffmpeg_stderr.decode(errors="replace"),
         )
 
     return PipelineResult(

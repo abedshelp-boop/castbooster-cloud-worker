@@ -7,7 +7,8 @@ from pydantic import BaseModel
 
 from auth import require_api_key
 from idle_watcher import IdleWatcher
-from run_rife import PipelineResult, run_rife
+from pipeline_types import PipelineResult
+from run_rife import run_rife
 
 app = FastAPI(title="castbooster-cloud-worker", version="0.1.0")
 
@@ -87,7 +88,11 @@ def process(req: ProcessRequest):
             output_dir=out_dir,
             extra_input_headers=req.source_headers or None,
         )
-    except ValueError as e:
+    except (ValueError, NotImplementedError) as e:
+        # ValueError = bad input (e.g. CRLF in headers). NotImplementedError =
+        # request shape is unsupported on this pipeline (e.g. headers in RIFE).
+        # Either way, MVP semantic is "your request can't be processed" → 400.
+        # Phase 2: split out 501 for NotImplementedError when we wire up lsmas.
         raise HTTPException(400, f"invalid request: {e}")
     if result.returncode != 0:
         # Truncate to last 500 chars; ffmpeg errors are noisy

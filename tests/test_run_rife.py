@@ -34,7 +34,6 @@ def test_run_rife_writes_vpy_and_spawns_processes(tmp_path, monkeypatch):
         source_url="https://egydead.example/anime.m3u8",
         output_dir=tmp_path,
         timeout_s=60,
-        extra_input_headers={"Cookie": "session=abc"},
     )
 
     assert result.returncode == 0
@@ -76,3 +75,27 @@ def test_run_rife_returns_502_on_ffmpeg_failure(tmp_path, monkeypatch):
     )
     assert result.returncode == 1
     assert "nvenc init failed" in result.stderr
+
+
+def test_run_rife_rejects_extra_input_headers(tmp_path, monkeypatch):
+    """RIFE pipeline reads source via vapoursynth/lsmas, not ffmpeg, so the
+    ffmpeg -headers path is dead. Caller passing headers must get a clear
+    NotImplementedError until lsmas format_opts wiring lands in Phase 2."""
+    from run_rife import run_rife
+
+    # subprocess.Popen should never be called — we should raise before then.
+    def fake_popen_should_not_run(cmd, **kwargs):
+        raise AssertionError(
+            f"subprocess.Popen called with {cmd!r} — "
+            "run_rife should raise NotImplementedError before spawning"
+        )
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen_should_not_run)
+
+    with pytest.raises(NotImplementedError, match="extra_input_headers"):
+        run_rife(
+            source_url="https://egydead.example/anime.m3u8",
+            output_dir=tmp_path,
+            timeout_s=60,
+            extra_input_headers={"Cookie": "session=abc"},
+        )
