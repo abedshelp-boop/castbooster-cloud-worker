@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from auth import require_api_key
 from idle_watcher import IdleWatcher
-from pipeline import PipelineResult, run_passthrough
+from run_rife import PipelineResult, run_rife
 
 app = FastAPI(title="castbooster-cloud-worker", version="0.1.0")
 
@@ -71,7 +71,7 @@ def _public_base_url() -> str:
 
 # Wrapped indirection so tests can monkeypatch a fake
 def run_pipeline_for_request(**kwargs) -> PipelineResult:
-    return run_passthrough(**kwargs)
+    return run_rife(**kwargs)
 
 
 @app.post("/process", dependencies=[Depends(require_api_key)])
