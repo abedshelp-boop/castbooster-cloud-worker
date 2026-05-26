@@ -37,6 +37,11 @@ def run_passthrough(
     cmd = ["ffmpeg", "-y"]
 
     if extra_input_headers:
+        for k, v in extra_input_headers.items():
+            if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
+                raise ValueError(
+                    f"header {k!r} contains CR/LF (injection attempt)"
+                )
         header_lines = "".join(f"{k}: {v}\r\n" for k, v in extra_input_headers.items())
         cmd += ["-headers", header_lines]
 
@@ -52,12 +57,19 @@ def run_passthrough(
         str(playlist),
     ]
 
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as e:
+        return PipelineResult(
+            returncode=-1,
+            stdout=(e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")),
+            stderr=f"ffmpeg passthrough timeout after {timeout_s}s",
+        )
     return PipelineResult(
         returncode=proc.returncode,
         stdout=proc.stdout,

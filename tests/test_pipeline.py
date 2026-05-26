@@ -45,3 +45,20 @@ def test_passthrough_fails_on_invalid_url(output_dir):
         timeout_s=10,
     )
     assert result.returncode != 0
+
+
+def test_passthrough_rejects_crlf_in_headers(output_dir, sample_path):
+    """CRLF in header keys or values must be rejected (HTTP smuggling guard)."""
+    with pytest.raises(ValueError, match="CR/LF"):
+        run_passthrough(
+            source_url=str(sample_path),
+            output_dir=output_dir,
+            extra_input_headers={"X-Injected": "value\r\nX-Smuggled: pwned"},
+        )
+
+    with pytest.raises(ValueError, match="CR/LF"):
+        run_passthrough(
+            source_url=str(sample_path),
+            output_dir=output_dir,
+            extra_input_headers={"X-Bad\r\nKey": "ok"},
+        )
