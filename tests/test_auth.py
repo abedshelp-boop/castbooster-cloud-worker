@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture(autouse=True)
 def set_api_key(monkeypatch):
     monkeypatch.setenv("CLOUD_API_KEY", "test-secret-key-12345")
+    monkeypatch.setenv("DISABLE_IDLE_WATCHER", "1")
 
 @pytest.fixture
 def client():

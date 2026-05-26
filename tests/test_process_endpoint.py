@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture(autouse=True)
 def set_api_key(monkeypatch, tmp_path):
     monkeypatch.setenv("CLOUD_API_KEY", "test-key-process")
+    monkeypatch.setenv("DISABLE_IDLE_WATCHER", "1")
     monkeypatch.setenv("HLS_SERVE_DIR", str(tmp_path / "hls"))
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://fake-pod-id-8080.proxy.runpod.net")
 
