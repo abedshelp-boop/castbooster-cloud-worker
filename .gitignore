@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+hls_serve/*.m3u8
+hls_serve/*.ts
+*.engine
+*.onnx
+.env
