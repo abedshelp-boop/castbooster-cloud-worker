@@ -97,6 +97,12 @@ def process(req: ProcessRequest):
     return {"hls_url": hls_url}
 
 
+@app.post("/stop", dependencies=[Depends(require_api_key)])
+async def stop():
+    _self_terminate_pod()
+    return {"status": "shutting_down"}
+
+
 @app.on_event("startup")
 def _start_idle_watcher():
     global _watcher
