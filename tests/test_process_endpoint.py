@@ -66,3 +66,19 @@ def test_process_returns_502_on_pipeline_failure(client, monkeypatch):
     )
     assert response.status_code == 502
     assert "ffmpeg error" in response.json()["detail"]
+
+
+def test_process_returns_400_on_crlf_in_headers(client):
+    """CRLF in source_headers must be rejected by the pipeline guard,
+    surfaced as 400 (bad input), not 500 (server error)."""
+    response = client.post(
+        "/process",
+        headers={"Authorization": "Bearer test-key-process"},
+        json={
+            "source_url": "https://example.com/anime.m3u8",
+            "source_headers": {"X-Bad": "v\r\nX-Smuggled: pwned"},
+        },
+    )
+    assert response.status_code == 400
+    assert "invalid request" in response.json()["detail"].lower()
+    assert "CR/LF" in response.json()["detail"]

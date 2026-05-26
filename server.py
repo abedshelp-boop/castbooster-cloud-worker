@@ -39,17 +39,20 @@ def run_pipeline_for_request(**kwargs) -> PipelineResult:
 
 
 @app.post("/process", dependencies=[Depends(require_api_key)])
-async def process(req: ProcessRequest):
+def process(req: ProcessRequest):
     out_dir = _hls_dir()
     base = _public_base_url()
     if not base:
         raise HTTPException(500, "PUBLIC_BASE_URL not configured")
 
-    result = run_pipeline_for_request(
-        source_url=req.source_url,
-        output_dir=out_dir,
-        extra_input_headers=req.source_headers or None,
-    )
+    try:
+        result = run_pipeline_for_request(
+            source_url=req.source_url,
+            output_dir=out_dir,
+            extra_input_headers=req.source_headers or None,
+        )
+    except ValueError as e:
+        raise HTTPException(400, f"invalid request: {e}")
     if result.returncode != 0:
         # Truncate to last 500 chars; ffmpeg errors are noisy
         raise HTTPException(502, detail=result.stderr[-500:] or "ffmpeg failed with no stderr")
