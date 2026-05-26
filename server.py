@@ -1,6 +1,5 @@
 # server.py
 import os
-import subprocess
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -29,11 +28,21 @@ def _self_terminate_pod():
         return
     try:
         import httpx
-        httpx.post(
+        resp = httpx.post(
             f"https://rest.runpod.io/v1/pods/{pod_id}/stop",
             headers={"Authorization": f"Bearer {runpod_api_key}"},
             timeout=10.0,
         )
+        if resp.status_code >= 400:
+            print(
+                f"[idle_watcher] RunPod stop returned {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+        else:
+            print(
+                f"[idle_watcher] Self-terminate requested for pod {pod_id} "
+                f"(status {resp.status_code})"
+            )
     except Exception as e:
         print(f"[idle_watcher] Self-terminate failed: {e}")
 

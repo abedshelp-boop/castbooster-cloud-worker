@@ -47,36 +47,43 @@ class IdleWatcher:
     def _loop(self):
         triggered = False
         while not self._stop_event.is_set() and not triggered:
+            should_trigger = False
             try:
                 now = time.time()
 
                 # Hard lifetime check
                 if self._started_at and (now - self._started_at) >= self.hard_max_lifetime_s:
-                    triggered = True
-                    self.on_shutdown()
-                    break
-
-                # Idle check — find newest file mtime in watch_dir
-                newest_mtime = 0.0
-                if self.watch_dir.exists():
-                    for path in self.watch_dir.iterdir():
-                        if path.is_file():
-                            mtime = path.stat().st_mtime
-                            if mtime > newest_mtime:
-                                newest_mtime = mtime
-
-                if newest_mtime == 0.0:
-                    # No files yet — count from watcher start time
-                    age = now - (self._started_at or now)
+                    should_trigger = True
                 else:
-                    age = now - newest_mtime
+                    # Idle check — find newest file mtime in watch_dir
+                    newest_mtime = 0.0
+                    if self.watch_dir.exists():
+                        for path in self.watch_dir.iterdir():
+                            if path.is_file():
+                                mtime = path.stat().st_mtime
+                                if mtime > newest_mtime:
+                                    newest_mtime = mtime
 
-                if age >= self.idle_seconds:
-                    triggered = True
+                    if newest_mtime == 0.0:
+                        # No files yet — count from watcher start time
+                        age = now - (self._started_at or now)
+                    else:
+                        age = now - newest_mtime
+
+                    if age >= self.idle_seconds:
+                        should_trigger = True
+            except Exception as e:
+                # Detection-side errors (FS races, perms) are transient — log + continue
+                print(f"[idle_watcher] detection error: {e}")
+
+            if should_trigger:
+                try:
                     self.on_shutdown()
-                    break
-            except Exception:
-                # Don't let the watcher die on transient errors
-                pass
+                except Exception as e:
+                    # Cost kill switch failed — visible, but watcher's done its job;
+                    # caller can re-create watcher if they want to retry
+                    print(f"[idle_watcher] on_shutdown failed: {e}")
+                triggered = True
+                break
 
             self._stop_event.wait(self.check_interval_s)
