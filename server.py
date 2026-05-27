@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.1.0")
+app = FastAPI(title="castbooster-cloud-worker", version="0.1.11")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -301,6 +301,10 @@ def process(req: ProcessRequest):
 
     if not base:
         print(f"[/process] ABORT: PUBLIC_BASE_URL not configured", file=sys.stderr, flush=True)
+        # NOTE: 500 stays HTTPException — short detail string, no risk of pipe-breaking.
+        # Only the longer 400/502 errors below were swapped to JSONResponse in v0.1.11
+        # because their multi-KB tracebacks were tripping FastAPI->uvicorn->nginx->CF
+        # and surfacing as bare Cloudflare 502s.
         raise HTTPException(500, "PUBLIC_BASE_URL not configured")
 
     try:
@@ -312,19 +316,49 @@ def process(req: ProcessRequest):
         )
         print(f"[/process] pipeline returned: returncode={result.returncode} stderr_tail={result.stderr[-200:]!r}", file=sys.stderr, flush=True)
     except (ValueError, NotImplementedError) as e:
+        # v0.1.11: JSONResponse instead of HTTPException — see notes above.
+        # `detail` key kept for backwards-compat with existing tests/clients;
+        # structured fields added per the dispatch spec for richer diagnostics.
         print(f"[/process] 400 invalid request: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        raise HTTPException(400, f"invalid request: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": f"invalid request: {e}",
+                "error_type": type(e).__name__,
+                "error_msg": str(e)[:1500],
+            },
+        )
     except Exception as e:
+        # v0.1.11: JSONResponse instead of HTTPException — multi-KB detail strings
+        # via HTTPException were getting mangled / dropped before reaching CF,
+        # producing bare Cloudflare 502s with no FastAPI body.
         tb_tail = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-1500:]
         print(f"[/process] 502 pipeline EXCEPTION: {type(e).__name__}: {e}\n{tb_tail}", file=sys.stderr, flush=True)
-        raise HTTPException(
-            502,
-            detail=f"pipeline error: {type(e).__name__}: {e}\n--- traceback (tail) ---\n{tb_tail}",
+        return JSONResponse(
+            status_code=502,
+            content={
+                "detail": f"pipeline error: {type(e).__name__}: {e}",
+                "error_type": type(e).__name__,
+                "error_msg": str(e)[:1500],
+                "traceback_tail": tb_tail,
+            },
         )
 
     if result.returncode != 0:
+        # v0.1.11: JSONResponse instead of HTTPException — ffmpeg stderr can be
+        # multi-KB and was likely contributing to the same pipe issue.
         print(f"[/process] 502 pipeline nonzero: rc={result.returncode}", file=sys.stderr, flush=True)
-        raise HTTPException(502, detail=result.stderr[-500:] or "ffmpeg failed with no stderr")
+        stderr_tail = result.stderr[-1500:] if result.stderr else ""
+        return JSONResponse(
+            status_code=502,
+            content={
+                "detail": stderr_tail[-500:] or "ffmpeg failed with no stderr",
+                "error_type": "PipelineNonZeroExit",
+                "error_msg": f"pipeline returncode={result.returncode}",
+                "returncode": result.returncode,
+                "stderr_tail": stderr_tail,
+            },
+        )
 
     hls_url = f"{base.rstrip('/')}/hls/playlist.m3u8"
     print(f"[/process] 200 SUCCESS hls_url={hls_url}", file=sys.stderr, flush=True)
@@ -677,6 +711,57 @@ def probe_bs_realize():
     except BaseException as e:
         return {
             "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
+# -----------------------------------------------------------------------------
+# v0.1.11 PARAMETERIZED SOURCE PROBE — added 2026-05-28. The hardcoded /probe/bs_*
+# endpoints couldn't open the mux master HLS playlist URL ("Couldn't open"). This
+# generic probe lets us URL-discovery-sweep different backends + URL shapes
+# (direct .ts / .mp4 / media playlist / master playlist) without rebuilding the
+# image. Returns the same structured JSON as the existing probes.
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/source", dependencies=[Depends(require_api_key)])
+def probe_source(backend: str = "bs", realize: bool = False, url: str = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"):
+    """Parameterized source probe — try different backends and URLs without rebuilding."""
+    import traceback as _tb
+    _log("/probe/source ENTER", backend=backend, realize=realize, url=url[:200])
+    try:
+        import vapoursynth as vs
+        core = vs.core
+        if backend == "bs":
+            src = core.bs.VideoSource(source=url, cachemode=0)
+        elif backend == "lsmas":
+            src = core.lsmas.LWLibavSource(source=url)
+        else:
+            return {"ok": False, "error": f"unknown backend: {backend}"}
+
+        result = {
+            "ok": True,
+            "backend": backend,
+            "url": url,
+            "num_frames": src.num_frames,
+            "fps_num": src.fps_num,
+            "fps_den": src.fps_den,
+            "width": src.width,
+            "height": src.height,
+            "format_name": src.format.name if src.format else None,
+        }
+        if realize:
+            frame = src.get_frame(0)
+            result["realized_frame_format"] = str(frame.format)
+            result["realized_frame_width"] = frame.width
+            result["realized_frame_height"] = frame.height
+        return result
+    except BaseException as e:
+        return {
+            "ok": False,
+            "backend": backend,
+            "url": url,
             "error_type": type(e).__name__,
             "error_msg": str(e)[:1000],
             "traceback": _tb.format_exc()[-1500:],
