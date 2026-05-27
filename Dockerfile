@@ -5,7 +5,7 @@
 # This community-maintained image (updated within the last 3 weeks) ships:
 #   - nvcr.io/nvidia/tensorrt:26.04-py3 base (CUDA 13 + TensorRT 10 + Python 3.12)
 #   - VapourSynth R73 built from source (libvapoursynth.so + python bindings)
-#   - vs-mlrt's libvstrt.so plugin built from source (at /usr/local/lib/vapoursynth/)
+#   - vs-mlrt's libvstrt.so plugin built from source (at /usr/local/lib/libvstrt.so)
 #   - lsmas / lsmashsource / bestsource / ffms2 VS plugins
 #   - ffmpeg static build with NVDEC/NVENC + libdav1d
 #   - g++-14 toolchain, zimg, cmake 4.1
@@ -60,20 +60,29 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 # the upstream release archive.
 RUN curl -L -o /tmp/vsmlrt-scripts.7z \
         https://github.com/AmusementClub/vs-mlrt/releases/download/v${VSMLRT_VERSION}/scripts.v${VSMLRT_VERSION}.7z \
-    && 7zz x /tmp/vsmlrt-scripts.7z -o/tmp/vsmlrt-scripts \
-    && cp /tmp/vsmlrt-scripts/vsmlrt.py /usr/local/lib/python3.12/site-packages/ \
+    && 7z x /tmp/vsmlrt-scripts.7z -o/tmp/vsmlrt-scripts \
+    && cp /tmp/vsmlrt-scripts/vsmlrt.py /usr/local/lib/python3.12/dist-packages/ \
     && rm -rf /tmp/vsmlrt-scripts /tmp/vsmlrt-scripts.7z
 
-# RIFE v4.6 ONNX model — vsmlrt.py searches `${MODEL_DIR}` or its built-in default
-# (alongside the .so plugin). The styler image installs libvstrt.so to
-# /usr/local/lib/vapoursynth/, so the standard model search path is
-# /usr/local/lib/vapoursynth/models/rife/ (vsmlrt.py's plugin_dir convention).
+# RIFE v4.6 ONNX model — vsmlrt.py resolves models at:
+#   models_path = os.path.dirname(<vstrt_plugin_path>) + "/models"
+# In the styler base image, vstrt CMake installs to /usr/local/lib/libvstrt.so
+# (see styler Dockerfile L629 and vstrt's CMakeLists default LIBDIR), so the
+# computed models_path is /usr/local/lib/models/. For RIFE v4.6, the file lookup
+# is at <models_path>/rife/rife_v4.6.onnx (vsmlrt.py v15.13 L1099-1103).
+#
+# vsmlrt.py has NO env-var or model_dir override — the path is fully derived
+# from where the .so plugin was loaded. So we install to /usr/local/lib/models/
+# (the actually-computed path) AND mirror to /usr/local/lib/vapoursynth/models/
+# (the convention used by some other VS plugin layouts) as belt-and-suspenders,
+# in case styler ever relocates libvstrt.so to the autoload dir in a later tag.
 # Extract only the RIFE subtree to keep the layer small (~850 MB archive → ~50 MB
 # kept for RIFE v4.6 model).
-RUN mkdir -p /usr/local/lib/vapoursynth/models \
+RUN mkdir -p /usr/local/lib/models /usr/local/lib/vapoursynth/models \
     && curl -L -o /tmp/vsmlrt-models.7z \
         https://github.com/AmusementClub/vs-mlrt/releases/download/v${VSMLRT_VERSION}/models.v${VSMLRT_VERSION}.7z \
-    && 7zz x /tmp/vsmlrt-models.7z -o/tmp/vsmlrt-models -y \
+    && 7z x /tmp/vsmlrt-models.7z -o/tmp/vsmlrt-models -y \
+    && cp -r /tmp/vsmlrt-models/models/rife /usr/local/lib/models/ \
     && cp -r /tmp/vsmlrt-models/models/rife /usr/local/lib/vapoursynth/models/ \
     && rm -rf /tmp/vsmlrt-models /tmp/vsmlrt-models.7z
 
