@@ -53,25 +53,42 @@ ARG VSMLRT_VERSION=15.13
 # Our app's WORKDIR (overrides base's /workspace/tensorrt)
 WORKDIR /app
 
-# System deps not in the base: nginx, p7zip-full (for vs-mlrt 7z archives),
-# curl/ca-certificates may already be present but cheap to ensure.
+# System deps not in the base: nginx, p7zip-full (for vs-mlrt 7z archives).
 #
-# v0.1.8: The :minimal_no_avx512 base is 7 months old (2025-10-30) and has
-# stale apt state — Ubuntu Noble has moved past the libcurl4t64/libc6/systemd
-# versions pinned in the base. Naively installing nginx triggers:
-#   "libc6 Breaks: systemd (< 256~rc4-1~) but 255.4-1ubuntu8.11 is to be installed"
-# We run `apt-get -y dist-upgrade` first to align glibc/systemd/libcurl with
-# the current Noble archive, then install our extras. dist-upgrade is safe
-# inside a Docker layer (no init system to disturb).
-RUN apt-get update \
-    && apt-get -y dist-upgrade \
-        -o Dpkg::Options::=--force-confnew \
-        -o Dpkg::Options::=--force-confdef \
+# v0.1.8 NOTE: The :minimal_no_avx512 base is 7 months old (2025-10-30).
+# The current Ubuntu Noble archive has moved past every package version
+# pinned in the base (libc6, systemd, libcurl4t64...); any apt install
+# from the live archive cascades into glibc/systemd dep conflicts.
+#
+# Solution: pin apt to Ubuntu's archive snapshot from 2025-10-30 (the
+# date the base image was built). snapshot.ubuntu.com mirrors the archive
+# at every point in time. The base's installed libs match that snapshot,
+# so nginx + p7zip-full install cleanly.
+#
+# Snapshot URL: https://snapshot.ubuntu.com/ubuntu/YYYYMMDDTHHMMSSZ/
+RUN set -eux \
+    && SNAPSHOT="20251030T000000Z" \
+    && SNAP_URL="https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}" \
+    # Disable any pre-existing apt sources (the base's live archive list +
+    # third-party PPAs that pin the wrong libcurl). We keep them as .bak so
+    # later layers can re-enable if needed. Wrapped in `bash -c` so the
+    # set -eux above doesn't trip on a no-match glob.
+    && bash -c 'for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do [ -f "$f" ] && mv "$f" "$f.bak"; done; true' \
+    # Write the pinned snapshot source list
+    && { \
+        echo "deb [check-valid-until=no] ${SNAP_URL} noble main restricted universe multiverse"; \
+        echo "deb [check-valid-until=no] ${SNAP_URL} noble-updates main restricted universe multiverse"; \
+        echo "deb [check-valid-until=no] ${SNAP_URL} noble-security main restricted universe multiverse"; \
+    } > /etc/apt/sources.list.d/snapshot.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
-        nginx \
+        nginx-light \
         p7zip-full \
-        ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && command -v 7z >/dev/null \
+    && command -v nginx >/dev/null \
+    && echo "[v0.1.8] system deps OK via snapshot ${SNAPSHOT}"
 
 # Python deps (Python 3.12 + pip already in base image).
 # Base ships pip system-wide; --break-system-packages avoids PEP-668 refusal.
