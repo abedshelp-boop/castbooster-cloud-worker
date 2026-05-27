@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.1.12")
+app = FastAPI(title="castbooster-cloud-worker", version="0.1.13")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -871,6 +871,112 @@ def probe_ffmpeg_protocols():
     except Exception as e:
         out["buildconf_error"] = f"{type(e).__name__}: {e}"
     return out
+
+
+# -----------------------------------------------------------------------------
+# v0.1.13 PARAMETERIZED FULL-RIFE PROBE — added 2026-05-28. v0.1.12 confirmed
+# bs.VideoSource works on the mux test URL (38075 frames decoded at frame 0),
+# but /process with the same URL still crashes uvicorn (CF 502 in 13.5s). The
+# existing /probe/rife_eval uses lsmas which fails immediately on HTTP, so it
+# never tested the RIFE step itself.
+#
+# This endpoint runs the SAME stages as /process (bs source → RGBS → optional
+# pad → RIFE → optional crop → YUV420P8) but exposes each stage as a parameter,
+# and returns structured JSON. If it succeeds, the bug is in non-pipeline code
+# (clip.output(y4m=True) → ffmpeg subprocess pipe). If it crashes uvicorn,
+# the bug is in RIFE/TRT itself.
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/rife_eval_url", dependencies=[Depends(require_api_key)])
+def probe_rife_eval_url(
+    url: str = "http://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+    pad_to_32: bool = True,
+    realize: bool = True,
+    use_trt: bool = True,
+):
+    """Run the full RIFE pipeline with a parameterized source URL.
+
+    Tests the same stages as /process but as a separate endpoint to bypass
+    POST-route-specific issues. Returns structured JSON; uses BestSource for
+    HTTP support; optionally pads to 32 and optionally realizes frame 0.
+    """
+    import traceback as _tb
+    _log(
+        "/probe/rife_eval_url ENTER",
+        url=url[:200],
+        pad_to_32=pad_to_32,
+        realize=realize,
+        use_trt=use_trt,
+    )
+    try:
+        import vapoursynth as vs
+        from vsmlrt import RIFE, Backend
+        core = vs.core
+
+        # Stage 1: source via bs (HTTP-capable)
+        src = core.bs.VideoSource(source=url, cachemode=0)
+        original_w, original_h = src.width, src.height
+
+        # Stage 2: convert to RGBS for RIFE
+        src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
+
+        # Stage 3: optional pad to multiple of 32
+        pad_w, pad_h = 0, 0
+        if pad_to_32:
+            pad_w = (32 - src.width % 32) % 32
+            pad_h = (32 - src.height % 32) % 32
+            if pad_w or pad_h:
+                src = core.std.AddBorders(src, right=pad_w, bottom=pad_h)
+
+        # Stage 4: RIFE 2x
+        backend = (
+            Backend.TRT(fp16=True, num_streams=2)
+            if use_trt
+            else Backend.ORT_CUDA(fp16=True)
+        )
+        out = RIFE(src, multi=2, model=46, backend=backend)
+
+        # Stage 5: optional crop back
+        if pad_w or pad_h:
+            out = core.std.Crop(out, right=pad_w, bottom=pad_h)
+
+        # Stage 6: convert back to YUV420P8
+        out = core.resize.Bilinear(out, format=vs.YUV420P8, matrix_s='709')
+
+        result = {
+            "ok": True,
+            "url": url,
+            "pad_to_32": pad_to_32,
+            "use_trt": use_trt,
+            "original_width": original_w,
+            "original_height": original_h,
+            "padded_width_added": pad_w,
+            "padded_height_added": pad_h,
+            "out_num_frames": out.num_frames,
+            "out_fps_num": out.fps_num,
+            "out_fps_den": out.fps_den,
+            "out_width": out.width,
+            "out_height": out.height,
+        }
+
+        if realize:
+            # THIS is where the TRT engine compiles (~5-10 min first call)
+            frame = out.get_frame(0)
+            result["realized_frame_format"] = str(frame.format)
+            result["realized_frame_width"] = frame.width
+            result["realized_frame_height"] = frame.height
+
+        return result
+    except BaseException as e:
+        return {
+            "ok": False,
+            "url": url,
+            "pad_to_32": pad_to_32,
+            "use_trt": use_trt,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1500],
+            "traceback": _tb.format_exc()[-2000:],
+        }
 
 
 @app.on_event("startup")
