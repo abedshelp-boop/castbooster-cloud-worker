@@ -4,7 +4,19 @@ set -e
 
 # Validate required env
 : "${CLOUD_API_KEY:?CLOUD_API_KEY must be set}"
-: "${PUBLIC_BASE_URL:?PUBLIC_BASE_URL must be set (e.g. https://pod-id-8080.proxy.runpod.net)}"
+
+# Auto-derive PUBLIC_BASE_URL from RUNPOD_POD_ID if not explicitly set.
+# RunPod injects RUNPOD_POD_ID into every pod's env automatically.
+if [ -z "${PUBLIC_BASE_URL:-}" ]; then
+    if [ -n "${RUNPOD_POD_ID:-}" ]; then
+        export PUBLIC_BASE_URL="https://${RUNPOD_POD_ID}-8080.proxy.runpod.net"
+        echo "[start.sh] Auto-derived PUBLIC_BASE_URL=$PUBLIC_BASE_URL from RUNPOD_POD_ID"
+    else
+        echo "[start.sh] ERROR: neither PUBLIC_BASE_URL nor RUNPOD_POD_ID is set." >&2
+        echo "[start.sh] One of them must be set so the worker knows its public hostname." >&2
+        exit 1
+    fi
+fi
 
 mkdir -p /var/hls
 

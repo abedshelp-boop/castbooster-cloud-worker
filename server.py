@@ -94,6 +94,16 @@ def process(req: ProcessRequest):
         # Either way, MVP semantic is "your request can't be processed" → 400.
         # Phase 2: split out 501 for NotImplementedError when we wire up lsmas.
         raise HTTPException(400, f"invalid request: {e}")
+    except Exception as e:
+        # Surface ANY other exception as a 502 with type, message, and short traceback.
+        # Without this, FastAPI swallows the error and Cloudflare returns a bare 502
+        # with no body — impossible to debug from outside the pod.
+        import traceback
+        tb_tail = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-1500:]
+        raise HTTPException(
+            502,
+            detail=f"pipeline error: {type(e).__name__}: {e}\n--- traceback (tail) ---\n{tb_tail}",
+        )
     if result.returncode != 0:
         # Truncate to last 500 chars; ffmpeg errors are noisy
         raise HTTPException(502, detail=result.stderr[-500:] or "ffmpeg failed with no stderr")
@@ -106,6 +116,111 @@ def process(req: ProcessRequest):
 async def stop():
     _self_terminate_pod()
     return {"status": "shutting_down"}
+
+
+@app.get("/diag", dependencies=[Depends(require_api_key)])
+def diag():
+    """Diagnostic endpoint: returns environment, tool versions, and vsmlrt state.
+
+    Used to localize /process failures without container shell access.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    def _check(cmd: list[str]) -> dict:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return {
+                "returncode": r.returncode,
+                "stdout": r.stdout[:500],
+                "stderr": r.stderr[:500],
+            }
+        except FileNotFoundError as e:
+            return {"error": f"FileNotFoundError: {e}"}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    # Probe vsmlrt import + RIFE model resolution
+    vsmlrt_info: dict = {}
+    try:
+        import vsmlrt as _vsmlrt  # type: ignore
+        vsmlrt_info["import_ok"] = True
+        try:
+            vsmlrt_info["plugins_path"] = _vsmlrt.get_plugins_path()
+        except Exception as e:
+            vsmlrt_info["plugins_path_error"] = f"{type(e).__name__}: {e}"
+        vsmlrt_info["models_path"] = getattr(_vsmlrt, "models_path", None)
+    except Exception as e:
+        vsmlrt_info["import_ok"] = False
+        vsmlrt_info["import_error"] = f"{type(e).__name__}: {e}"
+
+    # Probe vapoursynth core directly to see which plugins are actually loaded
+    vs_core_info: dict = {}
+    try:
+        import vapoursynth as vs  # type: ignore
+        vs_core_info["version"] = str(vs.core.version()).split("\n")[0] if hasattr(vs.core, "version") else "?"
+        loaded_plugins = []
+        try:
+            for ns in dir(vs.core):
+                if not ns.startswith("_"):
+                    loaded_plugins.append(ns)
+        except Exception as e:
+            loaded_plugins.append(f"<probe error: {e}>")
+        vs_core_info["namespaces"] = loaded_plugins[:50]  # cap to avoid huge responses
+    except Exception as e:
+        vs_core_info["error"] = f"{type(e).__name__}: {e}"
+
+    # Probe what model files we can find
+    model_dirs_to_check = [
+        "/usr/local/lib/models/rife",
+        "/usr/local/lib/vapoursynth/models/rife",
+        "/usr/local/share/vsmlrt/rife",
+    ]
+    model_files_found = {}
+    for d in model_dirs_to_check:
+        try:
+            if os.path.isdir(d):
+                model_files_found[d] = sorted(os.listdir(d))[:20]
+            else:
+                model_files_found[d] = None  # dir doesn't exist
+        except Exception as e:
+            model_files_found[d] = f"<error: {e}>"
+
+    # Probe libvstrt.so location (the actual one loaded, if any)
+    libvstrt_candidates = []
+    for path in [
+        "/usr/local/lib/libvstrt.so",
+        "/usr/local/lib/vapoursynth/libvstrt.so",
+        "/usr/lib/x86_64-linux-gnu/vapoursynth/libvstrt.so",
+    ]:
+        libvstrt_candidates.append({
+            "path": path,
+            "exists": os.path.exists(path),
+            "is_link": os.path.islink(path) if os.path.exists(path) else None,
+        })
+
+    return {
+        "env": {
+            "RUNPOD_POD_ID": os.environ.get("RUNPOD_POD_ID", ""),
+            "PUBLIC_BASE_URL": os.environ.get("PUBLIC_BASE_URL", ""),
+            "HLS_SERVE_DIR": os.environ.get("HLS_SERVE_DIR", ""),
+            "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        },
+        "binaries": {
+            "vspipe": shutil.which("vspipe"),
+            "ffmpeg": shutil.which("ffmpeg"),
+            "nginx": shutil.which("nginx"),
+            "python3": shutil.which("python3"),
+        },
+        "ffmpeg_version": _check(["ffmpeg", "-version"]),
+        "vspipe_version": _check(["vspipe", "--version"]),
+        "vsmlrt": vsmlrt_info,
+        "vapoursynth_core": vs_core_info,
+        "model_files": model_files_found,
+        "libvstrt_candidates": libvstrt_candidates,
+    }
 
 
 @app.on_event("startup")
