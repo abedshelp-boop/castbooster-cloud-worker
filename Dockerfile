@@ -72,9 +72,9 @@ RUN set -eux \
     && mkdir -p /usr/local/bin /etc/nginx /var/log/nginx /var/lib/nginx/body \
                 /var/lib/nginx/proxy /var/lib/nginx/fastcgi \
                 /var/lib/nginx/uwsgi /var/lib/nginx/scgi /run \
-    # nginx static binary (musl-linked, no libc deps)
+    # nginx static binary (musl-linked, no libc deps) from jirutka/nginx-binaries
     && curl -fsSL -o /usr/local/bin/nginx \
-        "https://github.com/nginx-binaries/nginx-binaries/releases/download/latest/nginx-1.29.8-x86_64-linux" \
+        "https://jirutka.github.io/nginx-binaries/nginx-1.28.3-x86_64-linux" \
     && chmod +x /usr/local/bin/nginx \
     && /usr/local/bin/nginx -v 2>&1 | head -1 \
     # 7-zip 24.09 — extract the statically-linked 7zzs from the official tarball
