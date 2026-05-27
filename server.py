@@ -1,8 +1,10 @@
 # server.py
 import os
+import sys
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 from auth import require_api_key
@@ -11,6 +13,34 @@ from pipeline_types import PipelineResult
 from run_rife import run_rife
 
 app = FastAPI(title="castbooster-cloud-worker", version="0.1.0")
+
+
+# Catch-all error logger: if any unhandled exception escapes a handler, log it
+# to stdout (visible in RunPod web UI logs) BEFORE FastAPI's error middleware
+# emits a 500. This is critical because Cloudflare 502s in <1s suggest the
+# upstream connection is severed before FastAPI can emit a response — but if
+# the handler raises a normal Python exception, this catches it and forces
+# a JSON 500 through nginx instead of a TCP RST.
+@app.exception_handler(Exception)
+async def _unhandled_exception(request: Request, exc: Exception):
+    import traceback as _tb
+    tb = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+    msg = (
+        f"[UNHANDLED] {request.method} {request.url.path} -> "
+        f"{type(exc).__name__}: {exc}\n{tb}"
+    )
+    print(msg, file=sys.stderr, flush=True)
+    print(msg, file=sys.stdout, flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "path": request.url.path,
+            "method": request.method,
+            "traceback_tail": tb[-1500:],
+        },
+    )
 
 _watcher: IdleWatcher | None = None
 
@@ -53,7 +83,95 @@ async def healthz():
 
 @app.get("/_test_protected", dependencies=[Depends(require_api_key)])
 async def _test_protected():
+    print("[/_test_protected] HIT", file=sys.stdout, flush=True)
+    print("[/_test_protected] HIT", file=sys.stderr, flush=True)
     return {"authorized": True}
+
+
+# -----------------------------------------------------------------------------
+# v0.1.6 DIAGNOSTIC ENDPOINTS — added 2026-05-27 to isolate the Cloudflare 502
+# pattern affecting /_test_protected and /process. Each varies ONE dimension
+# at a time vs. routes that work.
+#
+# Hits ALL get logged to BOTH stdout and stderr so RunPod's web UI tail
+# captures them. If a route gets a 502 from CF but we see the log line, the
+# response is being dropped between FastAPI->nginx->RunPod proxy->CF. If we
+# DON'T see the log line, the request never reached the handler.
+# -----------------------------------------------------------------------------
+
+def _log(tag: str, **fields):
+    """Log to both stdout and stderr with flush, so RunPod logs catch it."""
+    parts = " ".join(f"{k}={v!r}" for k, v in fields.items())
+    msg = f"[{tag}] {parts}"
+    print(msg, file=sys.stdout, flush=True)
+    print(msg, file=sys.stderr, flush=True)
+
+
+# /raw1: GET, no auth, JSON. Pure control. Should always work.
+@app.get("/raw1")
+async def raw1():
+    _log("/raw1 HIT")
+    return {"ok": True}
+
+
+# /raw2: GET, no auth, PlainTextResponse. Bypass JSON serialization.
+@app.get("/raw2")
+async def raw2():
+    _log("/raw2 HIT")
+    return PlainTextResponse(content="ok")
+
+
+# /raw3: GET, auth, JSON. Same shape as /_test_protected.
+@app.get("/raw3", dependencies=[Depends(require_api_key)])
+async def raw3():
+    _log("/raw3 HIT")
+    return {"ok": True}
+
+
+# /raw4: GET, auth, PlainTextResponse. Same as /raw3 but no JSON.
+@app.get("/raw4", dependencies=[Depends(require_api_key)])
+async def raw4():
+    _log("/raw4 HIT")
+    return PlainTextResponse(content="ok")
+
+
+# /raw5: POST, auth, JSON body, JSON response. Same shape as /process minus pipeline.
+class _RawBody(BaseModel):
+    msg: str = ""
+
+
+@app.post("/raw5", dependencies=[Depends(require_api_key)])
+async def raw5(req: _RawBody):
+    _log("/raw5 HIT", msg=req.msg[:80])
+    return {"ok": True, "received": req.msg}
+
+
+# /raw6: GET, auth, sync def (uses threadpool). Same as /raw3 but sync.
+@app.get("/raw6", dependencies=[Depends(require_api_key)])
+def raw6():
+    _log("/raw6 HIT (sync)")
+    return {"ok": True}
+
+
+# /raw7: GET, auth, explicit Response object. Bypasses FastAPI return-value handling.
+@app.get("/raw7", dependencies=[Depends(require_api_key)])
+async def raw7():
+    _log("/raw7 HIT")
+    return Response(content=b'{"ok":true}', media_type="application/json")
+
+
+# /raw8: POST, no auth, JSON body. Test if auth dep + POST + body together is the problem.
+@app.post("/raw8")
+async def raw8(req: _RawBody):
+    _log("/raw8 HIT", msg=req.msg[:80])
+    return {"ok": True, "received": req.msg}
+
+
+# /raw9: POST, no body (empty). Tests if just POST works without body.
+@app.post("/raw9", dependencies=[Depends(require_api_key)])
+async def raw9():
+    _log("/raw9 HIT")
+    return {"ok": True}
 
 
 class ProcessRequest(BaseModel):
@@ -77,8 +195,10 @@ def run_pipeline_for_request(**kwargs) -> PipelineResult:
 
 @app.post("/process", dependencies=[Depends(require_api_key)])
 def process(req: ProcessRequest):
-    import sys
     import traceback as _tb
+    # Log to BOTH stdout and stderr — v0.1.5 had only stderr and we never saw it
+    # in RunPod web UI logs. Mirror to stdout too.
+    _log("/process ENTER", source_url=req.source_url[:200])
     print(f"[/process] ENTER source_url={req.source_url[:200]}", file=sys.stderr, flush=True)
 
     out_dir = _hls_dir()
@@ -119,6 +239,7 @@ def process(req: ProcessRequest):
 
 @app.post("/stop", dependencies=[Depends(require_api_key)])
 async def stop():
+    _log("/stop HIT")
     _self_terminate_pod()
     return {"status": "shutting_down"}
 
@@ -129,6 +250,7 @@ def diag():
 
     Used to localize /process failures without container shell access.
     """
+    _log("/diag HIT")
     import os
     import shutil
     import subprocess
@@ -231,7 +353,9 @@ def diag():
 @app.on_event("startup")
 def _start_idle_watcher():
     global _watcher
+    _log("STARTUP", pid=os.getpid(), python=sys.version.split()[0])
     if os.environ.get("DISABLE_IDLE_WATCHER") == "1":
+        _log("STARTUP idle_watcher disabled (DISABLE_IDLE_WATCHER=1)")
         return  # tests
     _watcher = IdleWatcher(
         watch_dir=_hls_dir(),
@@ -241,6 +365,7 @@ def _start_idle_watcher():
         hard_max_lifetime_s=6 * 60 * 60,
     )
     _watcher.start()
+    _log("STARTUP idle_watcher started")
 
 
 @app.on_event("shutdown")
