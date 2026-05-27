@@ -3,6 +3,3 @@ uvicorn[standard]==0.32.*
 httpx==0.27.*
 pytest==8.*
 pytest-asyncio==0.24.*
-
-# vs-mlrt is GPU-only; install in Dockerfile, not via pip on dev machines
-vapoursynth==R69
