@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.1.11")
+app = FastAPI(title="castbooster-cloud-worker", version="0.1.12")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -766,6 +766,111 @@ def probe_source(backend: str = "bs", realize: bool = False, url: str = "https:/
             "error_msg": str(e)[:1000],
             "traceback": _tb.format_exc()[-1500:],
         }
+
+
+# -----------------------------------------------------------------------------
+# v0.1.12 NETWORK + FFMPEG-DIRECT PROBES — added 2026-05-28. v0.1.11 /probe/source
+# showed bs.VideoSource fails identically ("VideoSource: Couldn't open ...") on
+# every HTTP/HTTPS URL we threw at it (mux HLS, mux .ts, Google CDN BBB.mp4).
+# Need to disambiguate: is the pod offline? Does ffmpeg itself have HTTPS? Does
+# Python's stdlib reach the URL? These three probes test each layer independently.
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/net", dependencies=[Depends(require_api_key)])
+def probe_net(url: str = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"):
+    """Pure-Python network reachability check via urllib + DNS. No video libs."""
+    import traceback as _tb
+    import socket
+    from urllib.parse import urlparse
+    from urllib.request import Request, urlopen
+    _log("/probe/net ENTER", url=url[:200])
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    result: dict = {"url": url, "host": host, "scheme": parsed.scheme}
+    # DNS
+    try:
+        ips = socket.gethostbyname_ex(host)
+        result["dns_ok"] = True
+        result["dns_ips"] = ips[2][:5]
+    except Exception as e:
+        result["dns_ok"] = False
+        result["dns_error"] = f"{type(e).__name__}: {e}"
+    # HEAD / first 1KB
+    try:
+        req = Request(url, headers={"User-Agent": "castbooster-probe/0.1.12", "Range": "bytes=0-1023"})
+        with urlopen(req, timeout=15) as resp:
+            data = resp.read(1024)
+            result["http_ok"] = True
+            result["http_status"] = resp.status
+            result["http_content_type"] = resp.headers.get("Content-Type")
+            result["http_content_length"] = resp.headers.get("Content-Length")
+            result["http_first_bytes_hex"] = data[:64].hex()
+    except Exception as e:
+        result["http_ok"] = False
+        result["http_error_type"] = type(e).__name__
+        result["http_error"] = str(e)[:500]
+        result["http_traceback"] = _tb.format_exc()[-1000:]
+    return result
+
+
+@app.get("/probe/ffprobe", dependencies=[Depends(require_api_key)])
+def probe_ffprobe(url: str = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"):
+    """Run the bundled ffmpeg (as ffprobe) directly against the URL.
+    If this works but /probe/source doesn't, the bug is in bs/lsmas. If this
+    also fails, the bundled ffmpeg lacks TLS or there's a network/cert issue.
+    """
+    import subprocess
+    _log("/probe/ffprobe ENTER", url=url[:200])
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_streams",
+                "-show_format",
+                "-of", "json",
+                "-timeout", "10000000",  # microseconds -> 10s
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return {
+            "returncode": r.returncode,
+            "stdout_head": r.stdout[:2000],
+            "stderr_head": r.stderr[:2000],
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "ffprobe timeout 30s"}
+    except Exception as e:
+        return {"error_type": type(e).__name__, "error": str(e)[:500]}
+
+
+@app.get("/probe/ffmpeg_protocols", dependencies=[Depends(require_api_key)])
+def probe_ffmpeg_protocols():
+    """Dump ffmpeg's compiled-in protocols and TLS provider info.
+    Looks for https + (openssl|gnutls|libtls) markers in the build config + protocols list.
+    """
+    import subprocess
+    _log("/probe/ffmpeg_protocols ENTER")
+    out: dict = {}
+    try:
+        r = subprocess.run(["ffmpeg", "-protocols"], capture_output=True, text=True, timeout=10)
+        out["protocols_rc"] = r.returncode
+        out["protocols"] = r.stdout
+        out["protocols_stderr"] = r.stderr[:500]
+    except Exception as e:
+        out["protocols_error"] = f"{type(e).__name__}: {e}"
+    try:
+        r2 = subprocess.run(["ffmpeg", "-buildconf"], capture_output=True, text=True, timeout=10)
+        out["buildconf_rc"] = r2.returncode
+        # buildconf often goes to stderr in old ffmpeg builds
+        out["buildconf_stdout"] = r2.stdout[:3000]
+        out["buildconf_stderr"] = r2.stderr[:3000]
+    except Exception as e:
+        out["buildconf_error"] = f"{type(e).__name__}: {e}"
+    return out
 
 
 @app.on_event("startup")
