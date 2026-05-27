@@ -55,7 +55,19 @@ WORKDIR /app
 
 # System deps not in the base: nginx, p7zip-full (for vs-mlrt 7z archives),
 # curl/ca-certificates may already be present but cheap to ensure.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# v0.1.8: The :minimal_no_avx512 base is 7 months old (2025-10-30) and has
+# stale apt state — Ubuntu Noble has moved past the libcurl4t64/libc6/systemd
+# versions pinned in the base. Naively installing nginx triggers:
+#   "libc6 Breaks: systemd (< 256~rc4-1~) but 255.4-1ubuntu8.11 is to be installed"
+# We run `apt-get -y dist-upgrade` first to align glibc/systemd/libcurl with
+# the current Noble archive, then install our extras. dist-upgrade is safe
+# inside a Docker layer (no init system to disturb).
+RUN apt-get update \
+    && apt-get -y dist-upgrade \
+        -o Dpkg::Options::=--force-confnew \
+        -o Dpkg::Options::=--force-confdef \
+    && apt-get install -y --no-install-recommends \
         nginx \
         p7zip-full \
         ca-certificates curl \
