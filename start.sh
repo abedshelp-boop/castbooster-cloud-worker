@@ -37,8 +37,13 @@ uvicorn_loop() {
 uvicorn_loop &
 UVICORN_LOOP_PID=$!
 
-# Start nginx in foreground (so docker logs work)
-nginx -g 'daemon off;' &
+# Start nginx in foreground (so docker logs work).
+# v0.1.8: we use a static-binary nginx at /usr/local/bin/nginx, so we
+# pass an explicit prefix (-p) and config file (-c) to override the
+# binary's compile-time defaults. /etc/nginx is the prefix because that's
+# where we copy nginx.conf in the Dockerfile.
+echo "[start.sh] nginx version: $(nginx -v 2>&1)"
+nginx -p /etc/nginx -c /etc/nginx/nginx.conf -g 'daemon off;' &
 NGINX_PID=$!
 
 # Wait for either to exit. nginx exiting still kills the pod, but the

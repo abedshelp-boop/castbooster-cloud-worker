@@ -53,42 +53,45 @@ ARG VSMLRT_VERSION=15.13
 # Our app's WORKDIR (overrides base's /workspace/tensorrt)
 WORKDIR /app
 
-# System deps not in the base: nginx, p7zip-full (for vs-mlrt 7z archives).
+# System deps not in the base: nginx, 7z (for vs-mlrt 7z archives).
 #
 # v0.1.8 NOTE: The :minimal_no_avx512 base is 7 months old (2025-10-30).
 # The current Ubuntu Noble archive has moved past every package version
-# pinned in the base (libc6, systemd, libcurl4t64...); any apt install
-# from the live archive cascades into glibc/systemd dep conflicts.
+# pinned in the base. Apt-from-live-archive cascades into libc6/systemd
+# dep conflicts (libc-gconv-modules-extra 2.42 isn't installable).
 #
-# Solution: pin apt to Ubuntu's archive snapshot from 2025-10-30 (the
-# date the base image was built). snapshot.ubuntu.com mirrors the archive
-# at every point in time. The base's installed libs match that snapshot,
-# so nginx + p7zip-full install cleanly.
+# Approach: skip apt entirely. Fetch nginx and 7zz as static pre-built
+# binaries that don't depend on the base's libc state:
+#   - nginx 1.29.8 static x86_64 from common-binaries/nginx releases
+#     (statically linked with musl libc, openssl, pcre, zlib).
+#   - 7zzs 24.09 static x86_64 from ip7z/7zip releases (self-contained).
 #
-# Snapshot URL: https://snapshot.ubuntu.com/ubuntu/YYYYMMDDTHHMMSSZ/
+# curl + ca-certificates are already in the base; we use those as-is.
+# We deliberately do NOT touch /etc/apt/* — no apt install needed.
 RUN set -eux \
-    && SNAPSHOT="20251030T000000Z" \
-    && SNAP_URL="https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT}" \
-    # Disable any pre-existing apt sources (the base's live archive list +
-    # third-party PPAs that pin the wrong libcurl). We keep them as .bak so
-    # later layers can re-enable if needed. Wrapped in `bash -c` so the
-    # set -eux above doesn't trip on a no-match glob.
-    && bash -c 'for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do [ -f "$f" ] && mv "$f" "$f.bak"; done; true' \
-    # Write the pinned snapshot source list
-    && { \
-        echo "deb [check-valid-until=no] ${SNAP_URL} noble main restricted universe multiverse"; \
-        echo "deb [check-valid-until=no] ${SNAP_URL} noble-updates main restricted universe multiverse"; \
-        echo "deb [check-valid-until=no] ${SNAP_URL} noble-security main restricted universe multiverse"; \
-    } > /etc/apt/sources.list.d/snapshot.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        nginx-light \
-        p7zip-full \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && command -v 7z >/dev/null \
+    && mkdir -p /usr/local/bin /etc/nginx /var/log/nginx /var/lib/nginx/body \
+                /var/lib/nginx/proxy /var/lib/nginx/fastcgi \
+                /var/lib/nginx/uwsgi /var/lib/nginx/scgi /run \
+    # nginx static binary (musl-linked, no libc deps)
+    && curl -fsSL -o /usr/local/bin/nginx \
+        "https://github.com/nginx-binaries/nginx-binaries/releases/download/latest/nginx-1.29.8-x86_64-linux" \
+    && chmod +x /usr/local/bin/nginx \
+    && /usr/local/bin/nginx -v 2>&1 | head -1 \
+    # 7-zip 24.09 — extract the statically-linked 7zzs from the official tarball
+    && curl -fsSL -o /tmp/7z.tar.xz \
+        "https://github.com/ip7z/7zip/releases/download/24.09/7z2409-linux-x64.tar.xz" \
+    && mkdir -p /tmp/7z \
+    && tar -xJf /tmp/7z.tar.xz -C /tmp/7z \
+    && cp /tmp/7z/7zzs /usr/local/bin/7zzs \
+    && chmod +x /usr/local/bin/7zzs \
+    && ln -sf /usr/local/bin/7zzs /usr/local/bin/7z \
+    && rm -rf /tmp/7z /tmp/7z.tar.xz \
+    && /usr/local/bin/7z 2>&1 | head -3 \
+    # Confirm everything we need is available
+    && command -v curl >/dev/null \
     && command -v nginx >/dev/null \
-    && echo "[v0.1.8] system deps OK via snapshot ${SNAPSHOT}"
+    && command -v 7z >/dev/null \
+    && echo "[v0.1.8] static binaries installed: nginx + 7zzs"
 
 # Python deps (Python 3.12 + pip already in base image).
 # Base ships pip system-wide; --break-system-packages avoids PEP-668 refusal.
