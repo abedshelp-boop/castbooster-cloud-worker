@@ -86,6 +86,24 @@ RUN mkdir -p /usr/local/lib/models /usr/local/lib/vapoursynth/models \
     && cp -r /tmp/vsmlrt-models/models/rife /usr/local/lib/vapoursynth/models/ \
     && rm -rf /tmp/vsmlrt-models /tmp/vsmlrt-models.7z
 
+# libvstrt.so autoload fix: styler base installs it to /usr/local/lib/ (build artifact
+# location) but VapourSynth's autoload only scans /usr/local/lib/vapoursynth/. Symlink
+# so `from vsmlrt import RIFE` finds the plugin at runtime. Verified failing in v0.1.4
+# pod test (see vault gotchas/2026-05-27-cloud-worker-week1-acceptance.md).
+RUN mkdir -p /usr/local/lib/vapoursynth \
+    && if [ -f /usr/local/lib/libvstrt.so ]; then \
+           ln -sf /usr/local/lib/libvstrt.so /usr/local/lib/vapoursynth/libvstrt.so; \
+           echo "Symlinked libvstrt.so to /usr/local/lib/vapoursynth/"; \
+       else \
+           echo "WARNING: /usr/local/lib/libvstrt.so not found in base image"; \
+       fi \
+    && ls -la /usr/local/lib/vapoursynth/
+
+# Smoke-check: verify the vstrt namespace can be probed at all from Python.
+# Don't FAIL the build on this — it'll fail without a GPU at CI time anyway —
+# but log the result for debugging via docker history / build logs.
+RUN python3 -c "import vapoursynth as vs; namespaces = sorted([p for p in dir(vs.core) if not p.startswith('_')]); print('VS namespaces:', namespaces); print('trt loaded:', 'trt' in namespaces)" 2>&1 || true
+
 # Pre-bake the RIFE v4.6 TRT FP16 engine for RTX 4090 (Ada Lovelace = sm_89).
 # At build time there's no GPU in the CI runner, so this just exits cleanly and
 # the engine compiles on first /process call. Kept here so a future GPU-equipped

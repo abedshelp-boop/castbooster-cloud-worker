@@ -77,38 +77,43 @@ def run_pipeline_for_request(**kwargs) -> PipelineResult:
 
 @app.post("/process", dependencies=[Depends(require_api_key)])
 def process(req: ProcessRequest):
+    import sys
+    import traceback as _tb
+    print(f"[/process] ENTER source_url={req.source_url[:200]}", file=sys.stderr, flush=True)
+
     out_dir = _hls_dir()
     base = _public_base_url()
+    print(f"[/process] out_dir={out_dir} base={base}", file=sys.stderr, flush=True)
+
     if not base:
+        print(f"[/process] ABORT: PUBLIC_BASE_URL not configured", file=sys.stderr, flush=True)
         raise HTTPException(500, "PUBLIC_BASE_URL not configured")
 
     try:
+        print(f"[/process] Calling run_pipeline_for_request...", file=sys.stderr, flush=True)
         result = run_pipeline_for_request(
             source_url=req.source_url,
             output_dir=out_dir,
             extra_input_headers=req.source_headers or None,
         )
+        print(f"[/process] pipeline returned: returncode={result.returncode} stderr_tail={result.stderr[-200:]!r}", file=sys.stderr, flush=True)
     except (ValueError, NotImplementedError) as e:
-        # ValueError = bad input (e.g. CRLF in headers). NotImplementedError =
-        # request shape is unsupported on this pipeline (e.g. headers in RIFE).
-        # Either way, MVP semantic is "your request can't be processed" → 400.
-        # Phase 2: split out 501 for NotImplementedError when we wire up lsmas.
+        print(f"[/process] 400 invalid request: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         raise HTTPException(400, f"invalid request: {e}")
     except Exception as e:
-        # Surface ANY other exception as a 502 with type, message, and short traceback.
-        # Without this, FastAPI swallows the error and Cloudflare returns a bare 502
-        # with no body — impossible to debug from outside the pod.
-        import traceback
-        tb_tail = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-1500:]
+        tb_tail = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-1500:]
+        print(f"[/process] 502 pipeline EXCEPTION: {type(e).__name__}: {e}\n{tb_tail}", file=sys.stderr, flush=True)
         raise HTTPException(
             502,
             detail=f"pipeline error: {type(e).__name__}: {e}\n--- traceback (tail) ---\n{tb_tail}",
         )
+
     if result.returncode != 0:
-        # Truncate to last 500 chars; ffmpeg errors are noisy
+        print(f"[/process] 502 pipeline nonzero: rc={result.returncode}", file=sys.stderr, flush=True)
         raise HTTPException(502, detail=result.stderr[-500:] or "ffmpeg failed with no stderr")
 
     hls_url = f"{base.rstrip('/')}/hls/playlist.m3u8"
+    print(f"[/process] 200 SUCCESS hls_url={hls_url}", file=sys.stderr, flush=True)
     return {"hls_url": hls_url}
 
 

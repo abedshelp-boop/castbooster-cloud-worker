@@ -1,36 +1,45 @@
 # run_rife.py
-"""RIFE v4.6 TensorRT FP16 pipeline using vs-mlrt.
+"""RIFE v4.6 TensorRT FP16 pipeline using vs-mlrt's Python API directly.
 
-This module runs only inside the cloud Docker image (GPU required).
-Local dev machines without GPU should use run_passthrough instead.
+Bypasses the bundled vspipe wrapper (broken in our base image) by building the
+VapourSynth clip graph in-process and using clip.output() to stream y4m frames
+to ffmpeg's stdin via subprocess.
+
+This module runs only inside the cloud Docker image (GPU + vsmlrt required).
 """
+import os
 import subprocess
+import sys
+import traceback
 from pathlib import Path
 
 from pipeline_types import PipelineResult
 
 
-# VapourSynth script template — interpolates 2x via RIFE v4.6
-VPY_TEMPLATE = """
-import vapoursynth as vs
-from vsmlrt import RIFE, Backend
+def _build_clip(source_url: str):
+    """Construct the VapourSynth clip graph. Lazy import so the module is
+    importable on dev machines without VapourSynth installed (tests use mocks).
+    """
+    import vapoursynth as vs
+    from vsmlrt import RIFE, Backend
 
-core = vs.core
+    core = vs.core
 
-src = core.lsmas.LWLibavSource(source='{source_path}')
-src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
+    # Source: HTTP(S) HLS URL via lsmas (LWLibavSource)
+    src = core.lsmas.LWLibavSource(source=source_url)
+    src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
 
-# RIFE 2x temporal upsample (30fps source -> 60fps output)
-out = RIFE(
-    src,
-    multi=2,
-    model=46,  # RIFE v4.6
-    backend=Backend.TRT(fp16=True, num_streams=2),
-)
+    # RIFE 2x temporal upsample (30fps source -> 60fps output)
+    out = RIFE(
+        src,
+        multi=2,
+        model=46,  # RIFE v4.6
+        backend=Backend.TRT(fp16=True, num_streams=2),
+    )
 
-out = core.resize.Bilinear(out, format=vs.YUV420P8, matrix_s='709')
-out.set_output()
-"""
+    # Convert back to YUV420P8 for NVENC
+    out = core.resize.Bilinear(out, format=vs.YUV420P8, matrix_s='709')
+    return out
 
 
 def run_rife(
@@ -39,42 +48,55 @@ def run_rife(
     timeout_s: int = 7200,
     extra_input_headers: dict[str, str] | None = None,
 ) -> PipelineResult:
-    """Run RIFE v4.6 TRT FP16 pipeline: source -> 2x temporal interp -> HLS.
+    """Run RIFE v4.6 TRT FP16 pipeline using Python-direct VS API.
 
     Args:
-        source_url: source HLS URL (https://... or file://...)
+        source_url: source HLS URL (http://... or https://...)
         output_dir: directory for HLS playlist + .ts segments
         timeout_s: kill pipeline if it runs longer than this
-        extra_input_headers: optional HTTP headers (forwarded via ffmpeg -headers)
+        extra_input_headers: NOT supported in this pipeline yet (see below)
+
+    Returns:
+        PipelineResult with returncode, stdout, stderr
     """
+    print(f"[run_rife] START source_url={source_url[:200]} timeout_s={timeout_s}", flush=True)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     playlist = output_dir / "playlist.m3u8"
     segment_pattern = output_dir / "segment_%03d.ts"
 
-    # Write VPY script
-    vpy_path = output_dir / "pipeline.vpy"
-    vpy_path.write_text(VPY_TEMPLATE.format(source_path=source_url))
-
-    # vspipe streams raw frames -> ffmpeg encodes with NVENC -> HLS
-    vspipe_cmd = ["vspipe", "-c", "y4m", str(vpy_path), "-"]
-
-    ffmpeg_cmd = ["ffmpeg", "-y"]
+    # CRLF injection guard kept for defense-in-depth even though headers are
+    # rejected below — if Phase 2 wires headers through lsmas format_opts, the
+    # guard already exists and catches malformed input upstream.
     if extra_input_headers:
         for k, v in extra_input_headers.items():
             if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
-                raise ValueError(
-                    f"header {k!r} contains CR/LF (injection attempt)"
-                )
-        # ffmpeg reads from stdin (vspipe pipeline), so its -headers flag is dead code here.
-        # Headers must be forwarded via lsmas's format_opts inside the VPY script.
-        # Tracked as Phase 2 backlog (see Task 26 / Crunchyroll DRM work).
+                print(f"[run_rife] CRLF guard tripped on header {k!r}", flush=True)
+                raise ValueError(f"header {k!r} contains CR/LF (injection attempt)")
+        print(f"[run_rife] extra_input_headers passed but not yet supported", flush=True)
         raise NotImplementedError(
             "extra_input_headers not supported in RIFE pipeline yet — "
             "vapoursynth/lsmas reads the source, not ffmpeg. "
             "Phase 2: thread headers via lsmas format_opts."
         )
 
-    ffmpeg_cmd += [
+    # Build the clip graph
+    print(f"[run_rife] Building VS clip graph...", flush=True)
+    try:
+        clip = _build_clip(source_url)
+        print(f"[run_rife] clip built: {clip.num_frames} frames @ {clip.fps_num}/{clip.fps_den} fps, {clip.width}x{clip.height}", flush=True)
+    except Exception as e:
+        msg = f"clip build failed: {type(e).__name__}: {e}"
+        print(f"[run_rife] {msg}", flush=True)
+        return PipelineResult(
+            returncode=2,
+            stdout="",
+            stderr=msg + "\n" + traceback.format_exc(),
+        )
+
+    # Build the ffmpeg command — reads y4m from stdin, encodes via NVENC, HLS-muxes
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
         "-f", "yuv4mpegpipe",
         "-i", "-",
         "-c:v", "h264_nvenc",
@@ -91,58 +113,55 @@ def run_rife(
         "-hls_segment_filename", str(segment_pattern),
         str(playlist),
     ]
+    print(f"[run_rife] Spawning ffmpeg: {' '.join(ffmpeg_cmd[:6])} ...", flush=True)
 
-    # Pipe vspipe -> ffmpeg
-    vspipe_proc = subprocess.Popen(vspipe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Start ffmpeg, pipe clip.output() into its stdin
     ffmpeg_proc = subprocess.Popen(
-        ffmpeg_cmd, stdin=vspipe_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    vspipe_proc.stdout.close()  # allow vspipe to receive SIGPIPE if ffmpeg dies
 
     try:
-        ffmpeg_stdout, ffmpeg_stderr = ffmpeg_proc.communicate(timeout=timeout_s)
-        try:
-            vspipe_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            print("[run_rife] vspipe didn't exit within 5s of ffmpeg completion; killing")
-            vspipe_proc.kill()
-            try:
-                vspipe_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+        # clip.output(file, y4m=True) writes the y4m stream into the given file
+        # object. We pass ffmpeg's stdin pipe. This is blocking for the duration
+        # of the encoding.
+        print(f"[run_rife] Streaming frames into ffmpeg...", flush=True)
+        clip.output(ffmpeg_proc.stdin, y4m=True)
+        ffmpeg_proc.stdin.close()
+        print(f"[run_rife] clip.output() returned; waiting for ffmpeg...", flush=True)
+        stdout_bytes, stderr_bytes = ffmpeg_proc.communicate(timeout=timeout_s)
+        rc = ffmpeg_proc.returncode
+        print(f"[run_rife] ffmpeg returncode={rc}", flush=True)
+        return PipelineResult(
+            returncode=rc,
+            stdout=stdout_bytes.decode(errors="replace"),
+            stderr=stderr_bytes.decode(errors="replace"),
+        )
     except subprocess.TimeoutExpired:
-        # outer ffmpeg timeout
+        print(f"[run_rife] timeout after {timeout_s}s; killing ffmpeg", flush=True)
         ffmpeg_proc.kill()
-        vspipe_proc.kill()
+        try:
+            ffmpeg_proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         return PipelineResult(
             returncode=124,
             stdout="",
             stderr=f"pipeline timeout after {timeout_s}s",
         )
-
-    # Check vspipe first: it's the upstream of the pipe, so its failure mode
-    # (e.g. RIFE init crash, lsmas can't open source) usually explains
-    # whatever downstream ffmpeg error we'd otherwise show.
-    if vspipe_proc.returncode != 0:
-        vspipe_stderr = vspipe_proc.stderr.read().decode(errors="replace")
+    except Exception as e:
+        # clip.output() raises if VS error during processing (e.g. RIFE crash,
+        # OOM, source fetch fail). Always kill ffmpeg, surface the error.
+        print(f"[run_rife] EXCEPTION in clip.output() / communicate: {type(e).__name__}: {e}", flush=True)
+        try:
+            ffmpeg_proc.kill()
+            ffmpeg_proc.communicate(timeout=5)
+        except Exception:
+            pass
         return PipelineResult(
-            returncode=vspipe_proc.returncode,
+            returncode=3,
             stdout="",
-            stderr=(
-                f"vspipe failed: {vspipe_stderr}\n"
-                f"(ffmpeg returncode={ffmpeg_proc.returncode}, "
-                f"ffmpeg stderr tail: {ffmpeg_stderr.decode(errors='replace')[-200:]})"
-            ),
+            stderr=f"pipeline error: {type(e).__name__}: {e}\n{traceback.format_exc()}",
         )
-    if ffmpeg_proc.returncode != 0:
-        return PipelineResult(
-            returncode=ffmpeg_proc.returncode,
-            stdout=ffmpeg_stdout.decode(errors="replace"),
-            stderr=ffmpeg_stderr.decode(errors="replace"),
-        )
-
-    return PipelineResult(
-        returncode=0,
-        stdout=ffmpeg_stdout.decode(errors="replace"),
-        stderr=ffmpeg_stderr.decode(errors="replace"),
-    )
