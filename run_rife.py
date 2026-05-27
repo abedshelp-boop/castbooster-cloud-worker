@@ -25,8 +25,11 @@ def _build_clip(source_url: str):
 
     core = vs.core
 
-    # Source: HTTP(S) HLS URL via lsmas (LWLibavSource)
-    src = core.lsmas.LWLibavSource(source=source_url)
+    # Source: HTTP(S) HLS URL via BestSource (bs.VideoSource).
+    # BestSource supports HTTP URLs / HLS playlists natively (unlike lsmas which
+    # requires a local file + .lwi sidecar). cachemode=0 = no .ffi cache file
+    # (we don't need seek; we stream once).
+    src = core.bs.VideoSource(source=source_url, cachemode=0)
     src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
 
     # RIFE 2x temporal upsample (30fps source -> 60fps output)

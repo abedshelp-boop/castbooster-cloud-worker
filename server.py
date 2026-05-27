@@ -623,6 +623,66 @@ def probe_rife_eval_padded():
         }
 
 
+# -----------------------------------------------------------------------------
+# v0.1.10 BESTSOURCE PROBES — added 2026-05-27. v0.1.9 probes proved lsmas
+# (LWLibavSource) fails on HTTP URLs ("failed to construct index"). bs
+# (BestSource / VideoSource) supports HTTP/HLS natively. These probes verify
+# bs works end-to-end on the production base image before we hit /process.
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/bs_real", dependencies=[Depends(require_api_key)])
+def probe_bs_real():
+    """Try BestSource on the real test URL (no realization)."""
+    import traceback as _tb
+    try:
+        import vapoursynth as vs
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.bs.VideoSource(source=url, cachemode=0)
+        return {
+            "ok": True,
+            "num_frames": src.num_frames,
+            "fps_num": src.fps_num,
+            "fps_den": src.fps_den,
+            "width": src.width,
+            "height": src.height,
+            "format_name": src.format.name if src.format else None,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
+@app.get("/probe/bs_realize", dependencies=[Depends(require_api_key)])
+def probe_bs_realize():
+    """Try BestSource + decode frame 0."""
+    import traceback as _tb
+    try:
+        import vapoursynth as vs
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.bs.VideoSource(source=url, cachemode=0)
+        frame = src.get_frame(0)
+        return {
+            "ok": True,
+            "frame_format": str(frame.format),
+            "frame_width": frame.width,
+            "frame_height": frame.height,
+            "num_planes": frame.format.num_planes,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
 @app.on_event("startup")
 def _start_idle_watcher():
     global _watcher
