@@ -3,7 +3,7 @@ import os
 import sys
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.1.13")
+app = FastAPI(title="castbooster-cloud-worker", version="0.1.14")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -299,13 +299,19 @@ def process(req: ProcessRequest):
     base = _public_base_url()
     print(f"[/process] out_dir={out_dir} base={base}", file=sys.stderr, flush=True)
 
+    # v0.1.14: ALL error paths in /process now use JSONResponse instead of
+    # HTTPException. v0.1.11 swapped 400/502 only and left the 500 as
+    # HTTPException — but the multi-KB tracebacks we surface here (and the
+    # observation that Cloudflare emits a static 502 page when any HTTPException
+    # body exceeds some internal threshold) make a clean sweep the safer call.
+    # Auth (require_api_key dependency) still uses HTTPException — that's
+    # the right primitive for short auth-failure bodies.
     if not base:
         print(f"[/process] ABORT: PUBLIC_BASE_URL not configured", file=sys.stderr, flush=True)
-        # NOTE: 500 stays HTTPException — short detail string, no risk of pipe-breaking.
-        # Only the longer 400/502 errors below were swapped to JSONResponse in v0.1.11
-        # because their multi-KB tracebacks were tripping FastAPI->uvicorn->nginx->CF
-        # and surfacing as bare Cloudflare 502s.
-        raise HTTPException(500, "PUBLIC_BASE_URL not configured")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "PUBLIC_BASE_URL not configured"},
+        )
 
     try:
         print(f"[/process] Calling run_pipeline_for_request...", file=sys.stderr, flush=True)
@@ -316,28 +322,25 @@ def process(req: ProcessRequest):
         )
         print(f"[/process] pipeline returned: returncode={result.returncode} stderr_tail={result.stderr[-200:]!r}", file=sys.stderr, flush=True)
     except (ValueError, NotImplementedError) as e:
-        # v0.1.11: JSONResponse instead of HTTPException — see notes above.
-        # `detail` key kept for backwards-compat with existing tests/clients;
-        # structured fields added per the dispatch spec for richer diagnostics.
+        # v0.1.14: pure JSONResponse, drop "detail" key. The shape now matches
+        # the probe endpoints (error_type + error_msg). Tests assert on those.
         print(f"[/process] 400 invalid request: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return JSONResponse(
             status_code=400,
             content={
-                "detail": f"invalid request: {e}",
                 "error_type": type(e).__name__,
                 "error_msg": str(e)[:1500],
             },
         )
-    except Exception as e:
-        # v0.1.11: JSONResponse instead of HTTPException — multi-KB detail strings
-        # via HTTPException were getting mangled / dropped before reaching CF,
-        # producing bare Cloudflare 502s with no FastAPI body.
-        tb_tail = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-1500:]
+    except BaseException as e:
+        # v0.1.14: catch BaseException (not just Exception) so KeyboardInterrupt,
+        # SystemExit, and native-libs-style BaseException raises still surface as
+        # JSON instead of bringing down uvicorn.
+        tb_tail = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-2000:]
         print(f"[/process] 502 pipeline EXCEPTION: {type(e).__name__}: {e}\n{tb_tail}", file=sys.stderr, flush=True)
         return JSONResponse(
             status_code=502,
             content={
-                "detail": f"pipeline error: {type(e).__name__}: {e}",
                 "error_type": type(e).__name__,
                 "error_msg": str(e)[:1500],
                 "traceback_tail": tb_tail,
@@ -345,18 +348,13 @@ def process(req: ProcessRequest):
         )
 
     if result.returncode != 0:
-        # v0.1.11: JSONResponse instead of HTTPException — ffmpeg stderr can be
-        # multi-KB and was likely contributing to the same pipe issue.
         print(f"[/process] 502 pipeline nonzero: rc={result.returncode}", file=sys.stderr, flush=True)
-        stderr_tail = result.stderr[-1500:] if result.stderr else ""
         return JSONResponse(
             status_code=502,
             content={
-                "detail": stderr_tail[-500:] or "ffmpeg failed with no stderr",
-                "error_type": "PipelineNonZeroExit",
-                "error_msg": f"pipeline returncode={result.returncode}",
+                "error": "pipeline returncode nonzero",
                 "returncode": result.returncode,
-                "stderr_tail": stderr_tail,
+                "stderr_tail": result.stderr[-1500:] if result.stderr else "",
             },
         )
 

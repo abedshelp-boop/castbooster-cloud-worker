@@ -35,6 +35,12 @@
 #   - nginx (HLS edge)
 #   - vsmlrt.py Python wrapper module (NOT installed by the base — only libvstrt.so is)
 #   - RIFE v4.6 ONNX model (pruned from vs-mlrt v15.13 models bundle)
+#   - cuda-compat-13-0 (v0.1.14) — CUDA forward-compatibility shim so the
+#     CUDA-13 runtime baked into the styler base can talk to RunPod kernel
+#     drivers that only advertise CUDA-12.x (535/550/575). Without this,
+#     core.trt.DeviceProperties(0) raises "CUDA driver version is insufficient
+#     for CUDA runtime version" on first /process call. See big block before
+#     the install step for the full rationale.
 #   - Our app code + start.sh
 #
 # Trade-offs / risks:
@@ -49,6 +55,9 @@
 FROM docker.io/styler00dollar/vsgan_tensorrt:minimal_no_avx512
 
 ARG VSMLRT_VERSION=15.13
+# v0.1.14 — pinned cuda-compat-13-0 version. 580.x line covers CUDA 13.0
+# runtimes; bump alongside the styler base if it advances TRT/CUDA versions.
+ARG CUDA_COMPAT_VERSION=580.159.04-1ubuntu1
 
 # Our app's WORKDIR (overrides base's /workspace/tensorrt)
 WORKDIR /app
@@ -92,6 +101,56 @@ RUN set -eux \
     && command -v nginx >/dev/null \
     && command -v 7z >/dev/null \
     && echo "[v0.1.8] static binaries installed: nginx + 7zzs"
+
+# -----------------------------------------------------------------------------
+# v0.1.14 — CUDA forward-compatibility shim (`cuda-compat-13-0`)
+# -----------------------------------------------------------------------------
+# Problem: the styler base is built on `nvcr.io/nvidia/tensorrt:26.04-py3`,
+# which ships CUDA 13 runtime + TensorRT 10.13. RunPod's pods we land on
+# currently expose driver 535-575 (CUDA 12.x compatible). When we instantiate
+# `core.trt.DeviceProperties(0)` on the pod we hit:
+#
+#   CUDA error: driver version is insufficient for CUDA runtime version
+#
+# Mitigation: install NVIDIA's CUDA Forward Compatibility package
+# (`cuda-compat-13-0`). It ships a newer user-mode libcuda.so.580.x plus the
+# nvvm + ptxjit libs into `/usr/local/cuda-13.0/compat/`. When LD_LIBRARY_PATH
+# resolves libcuda.so from the compat dir first, the CUDA-13 runtime sees a
+# matching libcuda ABI (580) which transparently bridges to the older host
+# kernel module (535/550/575). See:
+#   https://docs.nvidia.com/deploy/cuda-compatibility/ (forward-compat section)
+#   https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/ ("CUDA Toolkit Versioning")
+#
+# Caveat: NVIDIA officially supports this only on TESLA/datacenter cards. On
+# RTX consumer cards (which RunPod uses for 4090 pods) it usually still works
+# because the user-mode ABI is identical; if a future pod driver is too old
+# it'll fail-fast with a clear error and we can pivot.
+#
+# Implementation note: we deliberately avoid `apt-get install` because the
+# styler base (Ubuntu Noble snapshot from 2025-10-30) has a frozen apt state
+# that cascades into libc6/systemd dep conflicts when reached out to live
+# repos (see v0.1.8 commentary above). Instead we curl the .deb file straight
+# from NVIDIA's repo and use `dpkg-deb -x` to extract only its payload —
+# no dpkg DB writes, no apt resolution. The .deb is self-contained: only
+# .so files under /usr/local/cuda-13.0/compat/.
+RUN set -eux \
+    && curl -fsSL -o /tmp/cuda-compat.deb \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-compat-13-0_${CUDA_COMPAT_VERSION}_amd64.deb" \
+    && mkdir -p /tmp/cuda-compat-extract \
+    && dpkg-deb -x /tmp/cuda-compat.deb /tmp/cuda-compat-extract \
+    && mkdir -p /usr/local/cuda-13.0/compat \
+    && cp -av /tmp/cuda-compat-extract/usr/local/cuda-13.0/compat/. /usr/local/cuda-13.0/compat/ \
+    && ln -sfn /usr/local/cuda-13.0/compat /usr/local/cuda/compat \
+    && rm -rf /tmp/cuda-compat.deb /tmp/cuda-compat-extract \
+    && echo "[v0.1.14] cuda-compat-13-0 extracted to /usr/local/cuda-13.0/compat/:" \
+    && ls -la /usr/local/cuda-13.0/compat/ | head -20
+
+# v0.1.14 — prepend compat dir to LD_LIBRARY_PATH so the dynamic linker
+# resolves libcuda.so.1 from the compat shim before the host-injected
+# /usr/local/nvidia/lib/libcuda.so.<host-driver>. RunPod's nvidia-container-
+# toolkit bind-mounts the host driver libs at startup; this env var ensures
+# our compat copy is searched first.
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:/usr/local/cuda/compat:${LD_LIBRARY_PATH}
 
 # Python deps (Python 3.12 + pip already in base image).
 # Base ships pip system-wide; --break-system-packages avoids PEP-668 refusal.
