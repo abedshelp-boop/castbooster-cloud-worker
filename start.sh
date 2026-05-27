@@ -20,13 +20,27 @@ fi
 
 mkdir -p /var/hls
 
-# Start FastAPI on :8001 (nginx proxies to it)
-uvicorn server:app --host 127.0.0.1 --port 8001 &
-UVICORN_PID=$!
+# v0.1.7: wrap uvicorn in a restart loop so a native crash in /process doesn't
+# take down the whole pod. Without this, a single segfault during clip-build
+# kills uvicorn and the container exits — RunPod restarts the whole container
+# (~30-90s downtime). With this loop, the next /process call gets a fresh
+# uvicorn within seconds.
+uvicorn_loop() {
+    while true; do
+        echo "[start.sh] Starting uvicorn (server:app) on :8001"
+        uvicorn server:app --host 127.0.0.1 --port 8001 || true
+        echo "[start.sh] uvicorn EXITED. Restarting in 2s." >&2
+        sleep 2
+    done
+}
+
+uvicorn_loop &
+UVICORN_LOOP_PID=$!
 
 # Start nginx in foreground (so docker logs work)
 nginx -g 'daemon off;' &
 NGINX_PID=$!
 
-# Wait for either to exit
-wait -n $UVICORN_PID $NGINX_PID
+# Wait for either to exit. nginx exiting still kills the pod, but the
+# uvicorn_loop only exits if SIGKILL'd, so it'll keep respawning uvicorn.
+wait -n $UVICORN_LOOP_PID $NGINX_PID

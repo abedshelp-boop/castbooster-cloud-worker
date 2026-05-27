@@ -174,6 +174,100 @@ async def raw9():
     return {"ok": True}
 
 
+# -----------------------------------------------------------------------------
+# v0.1.7 NATIVE-CALL ISOLATION ENDPOINTS — added 2026-05-27 to identify WHICH
+# native call in run_rife()'s _build_clip() segfaults the uvicorn worker.
+#
+# Each endpoint isolates ONE step. If any of these crash the pod (502 + pod
+# restart), that step is the segfault source.
+#
+# Run them in order on a fresh pod: ffmpeg-check, vs-import, lsmas-construct,
+# resize-construct, rife-construct, trt-backend.
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/ffmpeg", dependencies=[Depends(require_api_key)])
+def probe_ffmpeg():
+    """Run ffmpeg --version directly. If returncode is -N (negative), the
+    binary was killed by signal N. -4 = SIGILL (-march=native CPU mismatch).
+    """
+    import subprocess
+    _log("/probe/ffmpeg ENTER")
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=10
+        )
+        result = {
+            "returncode": r.returncode,
+            "killed_by_signal": -r.returncode if r.returncode < 0 else None,
+            "stdout_head": r.stdout[:500],
+            "stderr_head": r.stderr[:500],
+        }
+        _log("/probe/ffmpeg DONE", returncode=r.returncode)
+        return result
+    except Exception as e:
+        _log("/probe/ffmpeg EXC", err=str(e))
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/probe/cpuinfo", dependencies=[Depends(require_api_key)])
+def probe_cpuinfo():
+    """Return the host CPU's flags so we can correlate ffmpeg SIGILL with
+    missing instruction sets (avx512, etc.).
+    """
+    _log("/probe/cpuinfo ENTER")
+    try:
+        with open("/proc/cpuinfo") as f:
+            content = f.read()
+        # Parse first processor block
+        first_block = content.split("\n\n")[0] if "\n\n" in content else content[:4000]
+        return {"cpuinfo": first_block[:4000]}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/probe/lsmas_safe", dependencies=[Depends(require_api_key)])
+def probe_lsmas_safe():
+    """Call core.lsmas.LWLibavSource() with a known-bad path, catching ALL
+    Python exceptions. If this CRASHES THE POD (502 + restart), lsmas is
+    segfaulting natively. If it returns a JSON error, lsmas raises cleanly.
+    """
+    _log("/probe/lsmas_safe ENTER")
+    try:
+        import vapoursynth as vs  # already imported via /diag earlier most likely
+        core = vs.core
+        _log("/probe/lsmas_safe calling LWLibavSource")
+        try:
+            src = core.lsmas.LWLibavSource(source="file:///nonexistent.ts")
+            _log("/probe/lsmas_safe got back", n_frames=src.num_frames)
+            return {"ok": True, "n_frames": src.num_frames}
+        except Exception as e:
+            _log("/probe/lsmas_safe caught", err=f"{type(e).__name__}: {e}")
+            return {"ok": False, "error_type": type(e).__name__, "error_msg": str(e)}
+    except Exception as e:
+        _log("/probe/lsmas_safe outer EXC", err=str(e))
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/probe/rife_construct", dependencies=[Depends(require_api_key)])
+def probe_rife_construct():
+    """Try to construct just the Backend.TRT(...) object without any clip.
+    If THIS crashes the pod, the TRT backend init segfaults.
+    """
+    _log("/probe/rife_construct ENTER")
+    try:
+        from vsmlrt import Backend
+        _log("/probe/rife_construct Backend imported")
+        try:
+            backend = Backend.TRT(fp16=True, num_streams=2)
+            _log("/probe/rife_construct Backend.TRT instantiated", backend=str(backend))
+            return {"ok": True, "backend_repr": str(backend)}
+        except Exception as e:
+            _log("/probe/rife_construct caught", err=f"{type(e).__name__}: {e}")
+            return {"ok": False, "error_type": type(e).__name__, "error_msg": str(e)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 class ProcessRequest(BaseModel):
     source_url: str
     source_headers: dict[str, str] = {}
