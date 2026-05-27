@@ -1,9 +1,22 @@
 # Dockerfile
 # -----------------------------------------------------------------------------
-# Base: styler00dollar/vsgan_tensorrt:minimal (linux/amd64, ~6.1 GB compressed).
+# Base: styler00dollar/vsgan_tensorrt:minimal_no_avx512 (linux/amd64, ~5.5 GB).
 #
-# This community-maintained image (updated within the last 3 weeks) ships:
-#   - nvcr.io/nvidia/tensorrt:26.04-py3 base (CUDA 13 + TensorRT 10 + Python 3.12)
+# v0.1.8 — Switched from :minimal to :minimal_no_avx512 to fix SIGILL on
+# RunPod RTX 4090 pods landing on AMD EPYC 7C13 (Milan/Zen 3, no AVX-512).
+# The :minimal tag is built with -march=native on an AVX-512 host (7950x),
+# producing AVX-512 binaries that crash on EPYC 7C13 with -4 (SIGILL).
+# The :minimal_no_avx512 tag is a manual rebuild without AVX-512 — works
+# on Zen 3. See gotchas/2026-05-27-cloud-worker-week1-acceptance.md.
+#
+# Tag details (per Docker Hub manifest, 2026-05-27):
+#   - minimal_no_avx512  : 5.55 GB compressed, last updated 2025-10-30,
+#     TensorRT 10.13, ffmpeg+mlrt+ffms2+lsmash+bestsource.
+#   - minimal            : 6.24 GB, last updated 2026-05-08, TensorRT 10.16,
+#     but built with AVX-512 — SIGILLs on Milan/Zen 3.
+#
+# This community-maintained image ships:
+#   - nvcr.io/nvidia/tensorrt:* base (CUDA 13 + TensorRT 10.13 + Python 3.12)
 #   - VapourSynth R73 built from source (libvapoursynth.so + python bindings)
 #   - vs-mlrt's libvstrt.so plugin built from source (at /usr/local/lib/libvstrt.so)
 #   - lsmas / lsmashsource / bestsource / ffms2 VS plugins
@@ -24,17 +37,16 @@
 #   - RIFE v4.6 ONNX model (pruned from vs-mlrt v15.13 models bundle)
 #   - Our app code + start.sh
 #
-# Trade-offs / risks (DONE_WITH_CONCERNS):
-#   1. CUDA 13 in base, not 12.6 as previously pinned. RTX 4090 (sm_89) is fully
-#      supported by CUDA 13 and TRT 10. Drivers on RunPod 4090 pods (560+) support
-#      CUDA 13 runtime.
-#   2. Third-party image dependency. Mitigation: pin to a digest later (Phase 2);
-#      until then pin to the `:minimal` tag.
-#   3. Final image size will be ~6.5-7 GB compressed (~13-15 GB uncompressed).
-#      Acceptable for RunPod cold-start budget (24s with SW warming).
+# Trade-offs / risks:
+#   1. TRT 10.13 in :minimal_no_avx512 vs 10.16 in :minimal. vsmlrt 15.13
+#      supports both. RIFE v4.6 ONNX builds on both without ABI break.
+#   2. Tag last updated 7 months ago (2025-10-30). Acceptable for MVP;
+#      pin to digest at Phase 2.
+#   3. Third-party image dependency. Mitigation: pin to a digest later.
+#   4. Final image size ~5.5-6 GB compressed. Slightly smaller than v0.1.7.
 # -----------------------------------------------------------------------------
 
-FROM docker.io/styler00dollar/vsgan_tensorrt:minimal
+FROM docker.io/styler00dollar/vsgan_tensorrt:minimal_no_avx512
 
 ARG VSMLRT_VERSION=15.13
 
