@@ -444,6 +444,185 @@ def diag():
     }
 
 
+# -----------------------------------------------------------------------------
+# v0.1.9 GRANULAR VS GRAPH PROBES — added 2026-05-27 to isolate which step in
+# run_rife._build_clip() crashes /process. Each probe wraps ONE additional
+# stage of the VS pipeline on top of the previous probe, all wrapped in
+# try/except so uvicorn never crashes. They return structured JSON either way.
+#
+# Run in order on a fresh pod:
+#   /probe/lsmas_real     — lsmas LWLibavSource on real HTTP URL, NO realization
+#   /probe/lsmas_realize  — same + force decode of frame 0
+#   /probe/resize_rgbs    — add YUV->RGBS resize, realize frame 0
+#   /probe/rife_eval      — full pipeline: lsmas+resize+RIFE+reconvert, frame 0
+#                           (5-10 min TRT engine compile on first call)
+#   /probe/rife_eval_padded — same as rife_eval but pads source to mult-of-32
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/lsmas_real", dependencies=[Depends(require_api_key)])
+def probe_lsmas_real():
+    """Try lsmas on the real test URL with no further processing.
+    Returns clip metadata if successful; structured error if not."""
+    import traceback as _tb
+    _log("/probe/lsmas_real ENTER")
+    try:
+        import vapoursynth as vs
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.lsmas.LWLibavSource(source=url)
+        return {
+            "ok": True,
+            "num_frames": src.num_frames,
+            "fps_num": src.fps_num,
+            "fps_den": src.fps_den,
+            "width": src.width,
+            "height": src.height,
+            "format_name": src.format.name if src.format else None,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
+@app.get("/probe/lsmas_realize", dependencies=[Depends(require_api_key)])
+def probe_lsmas_realize():
+    """Try lsmas + force realization of frame 0 (actually decode).
+    This is what would crash if there's a codec/decoder issue."""
+    import traceback as _tb
+    _log("/probe/lsmas_realize ENTER")
+    try:
+        import vapoursynth as vs
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.lsmas.LWLibavSource(source=url)
+        # Force realization of frame 0
+        frame = src.get_frame(0)
+        return {
+            "ok": True,
+            "frame_format": str(frame.format),
+            "frame_width": frame.width,
+            "frame_height": frame.height,
+            "num_planes": frame.format.num_planes,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
+@app.get("/probe/resize_rgbs", dependencies=[Depends(require_api_key)])
+def probe_resize_rgbs():
+    """Add the YUV->RGBS resize on top of lsmas. Realize frame 0."""
+    import traceback as _tb
+    _log("/probe/resize_rgbs ENTER")
+    try:
+        import vapoursynth as vs
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.lsmas.LWLibavSource(source=url)
+        src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
+        frame = src.get_frame(0)
+        return {
+            "ok": True,
+            "frame_format": str(frame.format),
+            "frame_width": frame.width,
+            "frame_height": frame.height,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
+@app.get("/probe/rife_eval", dependencies=[Depends(require_api_key)])
+def probe_rife_eval():
+    """Full pipeline: lsmas + resize + RIFE + reconvert. Realize frame 0.
+    This will trigger the TRT engine compile on first call (~5-10 min)."""
+    import traceback as _tb
+    _log("/probe/rife_eval ENTER")
+    try:
+        import vapoursynth as vs
+        from vsmlrt import RIFE, Backend
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.lsmas.LWLibavSource(source=url)
+        src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
+        out = RIFE(src, multi=2, model=46, backend=Backend.TRT(fp16=True, num_streams=2))
+        out = core.resize.Bilinear(out, format=vs.YUV420P8, matrix_s='709')
+        frame = out.get_frame(0)
+        return {
+            "ok": True,
+            "frame_format": str(frame.format),
+            "frame_width": frame.width,
+            "frame_height": frame.height,
+            "out_num_frames": out.num_frames,
+            "out_fps_num": out.fps_num,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
+@app.get("/probe/rife_eval_padded", dependencies=[Depends(require_api_key)])
+def probe_rife_eval_padded():
+    """Same as rife_eval but explicitly pads the source so dimensions are
+    multiples of 32 (RIFE's requirement)."""
+    import traceback as _tb
+    _log("/probe/rife_eval_padded ENTER")
+    try:
+        import vapoursynth as vs
+        from vsmlrt import RIFE, Backend
+        core = vs.core
+        url = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+        src = core.lsmas.LWLibavSource(source=url)
+        src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
+
+        # Pad to multiple of 32 if needed
+        pad_w = (32 - src.width % 32) % 32
+        pad_h = (32 - src.height % 32) % 32
+        if pad_w or pad_h:
+            src = core.std.AddBorders(src, right=pad_w, bottom=pad_h)
+
+        out = RIFE(src, multi=2, model=46, backend=Backend.TRT(fp16=True, num_streams=2))
+
+        # Crop back if we padded
+        if pad_w or pad_h:
+            out = core.std.Crop(out, right=pad_w, bottom=pad_h)
+
+        out = core.resize.Bilinear(out, format=vs.YUV420P8, matrix_s='709')
+        frame = out.get_frame(0)
+        return {
+            "ok": True,
+            "padded_w": pad_w,
+            "padded_h": pad_h,
+            "frame_format": str(frame.format),
+            "frame_width": frame.width,
+            "frame_height": frame.height,
+            "out_num_frames": out.num_frames,
+        }
+    except BaseException as e:
+        return {
+            "ok": False,
+            "error_type": type(e).__name__,
+            "error_msg": str(e)[:1000],
+            "traceback": _tb.format_exc()[-1500:],
+        }
+
+
 @app.on_event("startup")
 def _start_idle_watcher():
     global _watcher
