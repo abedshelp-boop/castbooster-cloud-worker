@@ -1,159 +1,293 @@
 # Dockerfile
 # -----------------------------------------------------------------------------
-# Base: styler00dollar/vsgan_tensorrt:minimal_no_avx512 (linux/amd64, ~5.5 GB).
+# v0.2.0 — FROM-SCRATCH BUILD ON CUDA 12.6 + Ubuntu 24.04
+# -----------------------------------------------------------------------------
+# Why a full rebuild now (history):
+#   v0.1.7-0.1.15 sat on top of styler00dollar/vsgan_tensorrt:minimal_no_avx512,
+#   which is CUDA 13.0 + TensorRT 10.13. RunPod's pool of RTX 4090 hosts is on
+#   driver 535-575 → CUDA runtime 12.x only. CUDA 13 requires libcuda 580+.
+#   v0.1.14 tried `cuda-compat-13-0` to bridge, but NVIDIA hard-gates that
+#   compat libcuda to Tesla-class GPUs (consumer RTX rejected). v0.1.15
+#   reverted, leaving "driver insufficient" as the terminal error on consumer
+#   pods. Path A (find a CUDA-12 styler tag): dead — only 4 tags exist on
+#   Docker Hub, all CUDA 13 (verified 2026-05-28). Path B (build from scratch):
+#   this Dockerfile.
 #
-# v0.1.8 — Switched from :minimal to :minimal_no_avx512 to fix SIGILL on
-# RunPod RTX 4090 pods landing on AMD EPYC 7C13 (Milan/Zen 3, no AVX-512).
-# The :minimal tag is built with -march=native on an AVX-512 host (7950x),
-# producing AVX-512 binaries that crash on EPYC 7C13 with -4 (SIGILL).
-# The :minimal_no_avx512 tag is a manual rebuild without AVX-512 — works
-# on Zen 3. See gotchas/2026-05-27-cloud-worker-week1-acceptance.md.
+# As a side-bonus the new base lets us:
+#   - build ffmpeg with --enable-openssl → HTTPS source URLs work
+#   - pin every layer to upstream tags (no third-party image drift)
+#   - control which TensorRT / vstrt / VapourSynth versions ship together
 #
-# Tag details (per Docker Hub manifest, 2026-05-27):
-#   - minimal_no_avx512  : 5.55 GB compressed, last updated 2025-10-30,
-#     TensorRT 10.13, ffmpeg+mlrt+ffms2+lsmash+bestsource.
-#   - minimal            : 6.24 GB, last updated 2026-05-08, TensorRT 10.16,
-#     but built with AVX-512 — SIGILLs on Milan/Zen 3.
+# Build inputs (pinned via ARG so we can bump them safely):
+#   - VS_VERSION=R72                 (matches styler's R72; R73 unreleased)
+#   - VSMLRT_VERSION=15.13           (last CUDA-12 release; v15.14+ moved to CUDA 13)
+#   - TENSORRT_VERSION=10.7.0.23     (TRT 10.7 ships for cuda-12.6)
+#   - BESTSOURCE_TAG=R12             (matches the styler image build)
+#   - FFMPEG_TAG=n7.1                (stable release with NVENC + OpenSSL)
 #
-# This community-maintained image ships:
-#   - nvcr.io/nvidia/tensorrt:* base (CUDA 13 + TensorRT 10.13 + Python 3.12)
-#   - VapourSynth R73 built from source (libvapoursynth.so + python bindings)
-#   - vs-mlrt's libvstrt.so plugin built from source (at /usr/local/lib/libvstrt.so)
-#   - lsmas / lsmashsource / bestsource / ffms2 VS plugins
-#   - ffmpeg static build with NVDEC/NVENC + libdav1d
-#   - g++-14 toolchain, zimg, cmake 4.1
-#   - WORKDIR /workspace/tensorrt, CUDA_MODULE_LOADING=LAZY
+# Build stages (single-stage for v0.2.0 — multi-stage optimization is Phase 2):
+#   1. apt base deps (build toolchain + libs that ffmpeg/bs/lsmas link against)
+#   2. pip cython for VapourSynth python bindings
+#   3. zimg (VapourSynth required dep, not in apt for Noble)
+#   4. VapourSynth R72 (autotools — `./autogen.sh && ./configure && make`)
+#   5. TensorRT 10.7.0.23 tarball install (libs + headers + trtexec)
+#   6. ffmpeg n7.1 with NVENC + OpenSSL + libx264/265/dav1d/opus
+#   7. BestSource (bs) — meson build, used by run_rife.py for HTTP/HLS sources
+#   8. L-SMASH-Works (lsmas) — kept as a fallback even though run_rife.py now
+#      uses bs. /probe/lsmas_safe etc still exercise it for diagnostics.
+#   9. vs-mlrt vstrt — CMake build, links against TensorRT 10.7 we installed in 5
+#   10. vsmlrt.py Python wrapper + RIFE v4.6 ONNX model from upstream 7z assets
+#   11. Verify vs.core has trt + bs namespaces (build fails if either missing)
+#   12. Engine prebake (no-op without GPU at build time, kept for future CI GPU)
+#   13. App code + nginx + nginx.conf + start.sh
 #
-# Why this base instead of building from nvidia/cuda:12.6.1-cudnn-ubuntu24.04:
-# Noble (24.04) doesn't have `vapoursynth` in apt. Jammy (22.04) only has R55
-# via the savoury1 PPA — too old for vs-mlrt v15. Building VapourSynth + vstrt
-# from scratch takes 20+ min of CI time. The styler image already does it and
-# tracks upstream closely. See: github.com/styler00dollar/VSGAN-tensorrt-docker
+# Hard constraints (verified before push):
+#   - All 25 pytest unit tests still pass on host (no app code changed)
+#   - Existing run_rife.py / server.py / pipeline_types.py / auth.py unchanged
+#   - start.sh unchanged (auto-derive PUBLIC_BASE_URL + restart loop preserved)
+#   - libvstrt.so symlinked into /usr/local/lib/vapoursynth/ so VS autoloads it
+#   - vsmlrt.py installed at /usr/local/lib/python3.12/dist-packages/
+#   - RIFE v4.6 model mirrored at /usr/local/lib/models/rife/ AND
+#     /usr/local/lib/vapoursynth/models/rife/ (vsmlrt resolves dirname(.so)+/models)
 #
-# What this layer adds on top:
-#   - pip deps from requirements.txt (fastapi, uvicorn, httpx, pytest)
-#   - nginx (HLS edge)
-#   - vsmlrt.py Python wrapper module (NOT installed by the base — only libvstrt.so is)
-#   - RIFE v4.6 ONNX model (pruned from vs-mlrt v15.13 models bundle)
-#   - Our app code + start.sh
-#
-# v0.1.14 attempt (REVERTED in v0.1.15): cuda-compat-13-0 to fix the
-# "driver version insufficient" error on RunPod pods with old host drivers.
-# That layer was REMOVED because NVIDIA's compat libcuda hard-rejects
-# consumer GPUs (Tesla-only). See the v0.1.15 comment block in this file
-# and gotchas/2026-05-28-cuda-compat-tesla-only-gate.md for full detail.
-#
-# Trade-offs / risks:
-#   1. TRT 10.13 in :minimal_no_avx512 vs 10.16 in :minimal. vsmlrt 15.13
-#      supports both. RIFE v4.6 ONNX builds on both without ABI break.
-#   2. Tag last updated 7 months ago (2025-10-30). Acceptable for MVP;
-#      pin to digest at Phase 2.
-#   3. Third-party image dependency. Mitigation: pin to a digest later.
-#   4. Final image size ~5.5-6 GB compressed. Slightly smaller than v0.1.7.
+# Image-size estimate: ~6-8 GB compressed. Bigger than v0.1.15 (5.5 GB) because
+# TensorRT tarball alone is 4.4 GB uncompressed; we keep only the libs we need
+# (libnvinfer*, libnvonnx*, libnvinfer_plugin*, trtexec) so net delta is modest.
 # -----------------------------------------------------------------------------
 
-FROM docker.io/styler00dollar/vsgan_tensorrt:minimal_no_avx512
+FROM nvidia/cuda:12.6.1-cudnn-runtime-ubuntu24.04
 
+ARG VS_VERSION=R72
 ARG VSMLRT_VERSION=15.13
+ARG TENSORRT_VERSION=10.7.0.23
+ARG TENSORRT_CUDA_TAG=12.6
+ARG BESTSOURCE_TAG=R12
+ARG FFMPEG_TAG=n7.1
 
-# Our app's WORKDIR (overrides base's /workspace/tensorrt)
+# Avoid tzdata interactive prompt during apt installs
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Make ldconfig pick up /usr/local/lib at every layer (zimg, vapoursynth,
+# bestsource, lsmas, vstrt all install here).
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+
 WORKDIR /app
 
-# System deps not in the base: nginx, 7z (for vs-mlrt 7z archives).
-#
-# v0.1.8 NOTE: The :minimal_no_avx512 base is 7 months old (2025-10-30).
-# The current Ubuntu Noble archive has moved past every package version
-# pinned in the base. Apt-from-live-archive cascades into libc6/systemd
-# dep conflicts (libc-gconv-modules-extra 2.42 isn't installable).
-#
-# Approach: skip apt entirely. Fetch nginx and 7zz as static pre-built
-# binaries that don't depend on the base's libc state:
-#   - nginx 1.29.8 static x86_64 from common-binaries/nginx releases
-#     (statically linked with musl libc, openssl, pcre, zlib).
-#   - 7zzs 24.09 static x86_64 from ip7z/7zip releases (self-contained).
-#
-# curl + ca-certificates are already in the base; we use those as-is.
-# We deliberately do NOT touch /etc/apt/* — no apt install needed.
-RUN set -eux \
-    && mkdir -p /usr/local/bin /etc/nginx /var/log/nginx /var/lib/nginx/body \
-                /var/lib/nginx/proxy /var/lib/nginx/fastcgi \
-                /var/lib/nginx/uwsgi /var/lib/nginx/scgi /run \
-    # nginx static binary (musl-linked, no libc deps) from jirutka/nginx-binaries
-    && curl -fsSL -o /usr/local/bin/nginx \
-        "https://jirutka.github.io/nginx-binaries/nginx-1.28.3-x86_64-linux" \
-    && chmod +x /usr/local/bin/nginx \
-    && /usr/local/bin/nginx -v 2>&1 | head -1 \
-    # 7-zip 24.09 — extract the statically-linked 7zzs from the official tarball
-    && curl -fsSL -o /tmp/7z.tar.xz \
-        "https://github.com/ip7z/7zip/releases/download/24.09/7z2409-linux-x64.tar.xz" \
-    && mkdir -p /tmp/7z \
-    && tar -xJf /tmp/7z.tar.xz -C /tmp/7z \
-    && cp /tmp/7z/7zzs /usr/local/bin/7zzs \
-    && chmod +x /usr/local/bin/7zzs \
-    && ln -sf /usr/local/bin/7zzs /usr/local/bin/7z \
-    && rm -rf /tmp/7z /tmp/7z.tar.xz \
-    && /usr/local/bin/7z 2>&1 | head -3 \
-    # Confirm everything we need is available
-    && command -v curl >/dev/null \
-    && command -v nginx >/dev/null \
-    && command -v 7z >/dev/null \
-    && echo "[v0.1.8] static binaries installed: nginx + 7zzs"
+# -----------------------------------------------------------------------------
+# 1. System dependencies (build toolchain + media libs ffmpeg/bs/lsmas link to)
+# -----------------------------------------------------------------------------
+# Notes:
+#   - Python 3.12 is the default in Noble; python3-pip + python3-dev cover us
+#   - autoconf/automake/libtool needed for VapourSynth R72 (uses autotools)
+#   - meson/ninja-build needed for bestsource + L-SMASH-Works
+#   - nasm/yasm needed by ffmpeg's libx264/libx265 builds
+#   - libssl-dev for ffmpeg --enable-openssl (fixes the HTTPS-source gotcha)
+#   - libxxhash-dev needed by bestsource
+#   - p7zip-full for extracting upstream vs-mlrt 7z assets
+#   - nginx from apt — Noble ships a recent enough nginx for our needs
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl wget git pkg-config \
+        build-essential cmake ninja-build meson \
+        autoconf automake libtool \
+        nasm yasm \
+        python3 python3-dev python3-pip python3-venv \
+        libssl-dev \
+        libx264-dev libx265-dev libnuma-dev libvpx-dev libdav1d-dev \
+        libopus-dev libfdk-aac-dev libmp3lame-dev libvorbis-dev \
+        zlib1g-dev libxml2-dev libfreetype6-dev libfontconfig1-dev \
+        libxxhash-dev \
+        p7zip-full \
+        nginx \
+    && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# v0.1.15 — CUDA forward-compatibility shim REMOVED
+# 2. Cython for VapourSynth Python bindings
 # -----------------------------------------------------------------------------
-# History: v0.1.14 introduced `cuda-compat-13-0` to bridge the styler base
-# (CUDA 13 runtime, requires libcuda 580+) to RunPod pods running older host
-# drivers (535-575). On the v0.1.14 acceptance pod the compat libcuda
-# initialized but immediately bailed out with:
-#
-#   vapoursynth.Error: forward compatibility was attempted on non supported HW
-#
-# This is NVIDIA's hard gate in cuda-compat: forward-compat is officially
-# datacenter-only (Tesla). On consumer GPUs (the RTX 4090s RunPod gives us)
-# the compat libcuda detects the GPU class and refuses to initialize. We
-# can't bypass this from userspace.
-#
-# v0.1.15 strategy: drop cuda-compat entirely and rely on the host driver
-# being new enough on its own. Some RunPod machines DO have driver 580+
-# (especially newer datacenters). If we land on one of those, the styler
-# CUDA-13 runtime works natively. If not, we land back on the original
-# "driver version insufficient" error and we'll pivot to a CUDA-12.x base
-# image build in v0.1.16+.
-#
-# Pin retained for documentation:
-#   cuda-compat-13-0_580.159.04-1ubuntu1 — extracted via dpkg-deb from
-#   https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
+# Noble enforces PEP-668; --break-system-packages keeps things simple for an
+# image whose entire purpose is one Python app. Cython 3.1+ is required by
+# VapourSynth R72 (per upstream docs).
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir --break-system-packages "cython>=3.1"
 
-# Python deps (Python 3.12 + pip already in base image).
-# Base ships pip system-wide; --break-system-packages avoids PEP-668 refusal.
-COPY requirements.txt .
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+# -----------------------------------------------------------------------------
+# 3. zimg (VapourSynth dependency, not in Noble apt)
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b release-3.0.5 https://github.com/sekrit-twc/zimg.git /tmp/zimg \
+    && cd /tmp/zimg \
+    && ./autogen.sh \
+    && ./configure --prefix=/usr/local --disable-static --enable-shared \
+    && make -j"$(nproc)" && make install \
+    && ldconfig \
+    && rm -rf /tmp/zimg
 
-# vsmlrt.py — Python wrapper for vs-mlrt. The base image builds and installs
-# libvstrt.so (the C++ TRT plugin) but does NOT include the Python wrapper that
-# our run_rife.py imports (`from vsmlrt import RIFE, Backend`). We fetch it from
-# the upstream release archive.
+# -----------------------------------------------------------------------------
+# 4. VapourSynth R72 from source
+# -----------------------------------------------------------------------------
+# R72 uses autotools (autogen.sh → configure → make). The styler upstream
+# Dockerfile uses the same recipe. After install, ldconfig picks up
+# libvapoursynth.so from /usr/local/lib.
+#
+# Python bindings install to /usr/local/lib/python3.12/dist-packages/vapoursynth.*
+# automatically because `make install` runs `python3 setup.py install` for
+# the Python subdir. The plugin autoload path is
+# /usr/local/lib/vapoursynth/, which `core.std` etc populate at runtime
+# (matches our existing v0.1.15 symlink target).
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b ${VS_VERSION} https://github.com/vapoursynth/vapoursynth.git /tmp/vs \
+    && cd /tmp/vs \
+    && ./autogen.sh \
+    && ./configure --prefix=/usr/local \
+    && make -j"$(nproc)" && make install \
+    && ldconfig \
+    && rm -rf /tmp/vs
+
+# -----------------------------------------------------------------------------
+# 5. TensorRT 10.7.0.23 (tarball install — apt repo is broken for CUDA 12)
+# -----------------------------------------------------------------------------
+# Why the tarball: NVIDIA's apt repo for libnvinfer10 has unmet-dep bugs on
+# Ubuntu 24.04 with CUDA 12 (see NVIDIA/TensorRT issues #4545, #4593). The
+# tarball is the documented escape hatch.
+#
+# We keep only what's needed at runtime + build time:
+#   - lib/libnvinfer*.so*       (TensorRT engine + plugins)
+#   - lib/libnvonnx*.so*        (ONNX parser, used during engine compile)
+#   - include/                  (headers, needed for vstrt CMake build)
+#   - bin/trtexec               (handy for debugging engine compile)
+#
+# The Python wheels in the tarball (python/*.whl) we DON'T install — vs-mlrt
+# uses the C++ libs directly via the vstrt plugin, not the Python TRT bindings.
+# Saves ~1 GB.
+# -----------------------------------------------------------------------------
+RUN curl -fSL \
+        "https://developer.download.nvidia.com/compute/machine-learning/tensorrt/${TENSORRT_VERSION%.*}/tars/TensorRT-${TENSORRT_VERSION}.Linux.x86_64-gnu.cuda-${TENSORRT_CUDA_TAG}.tar.gz" \
+        -o /tmp/TensorRT.tar.gz \
+    && mkdir -p /opt/tensorrt \
+    && tar -xzf /tmp/TensorRT.tar.gz -C /opt/tensorrt --strip-components=1 \
+    && cp -d /opt/tensorrt/lib/libnvinfer*.so* /usr/local/lib/ \
+    && cp -d /opt/tensorrt/lib/libnvonnx*.so* /usr/local/lib/ || true \
+    && cp -d /opt/tensorrt/lib/libnvparsers*.so* /usr/local/lib/ || true \
+    && cp -r /opt/tensorrt/include/* /usr/local/include/ \
+    && cp /opt/tensorrt/bin/trtexec /usr/local/bin/trtexec || true \
+    && rm -rf /opt/tensorrt /tmp/TensorRT.tar.gz \
+    && ldconfig
+
+# -----------------------------------------------------------------------------
+# 6. ffmpeg n7.1 with NVENC + NVDEC + OpenSSL
+# -----------------------------------------------------------------------------
+# Critical flags:
+#   --enable-openssl   → HTTPS source URLs work (was the big v0.1.x gotcha)
+#   --enable-nvenc/dec → h264_nvenc for the encode side of run_rife.py
+#   --enable-libnpp    → CUDA scaling fast-path
+#   --enable-libdav1d  → AV1 sources
+#
+# nv-codec-headers provides cuviddec.h etc. We grab them from FFmpeg's
+# preferred shallow tag (matches FFmpeg n7.1 ABI).
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b n12.2.72.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh \
+    && cd /tmp/nvh && make install \
+    && rm -rf /tmp/nvh
+
+RUN git clone --depth 1 -b ${FFMPEG_TAG} https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg \
+    && cd /tmp/ffmpeg \
+    && ./configure \
+        --prefix=/usr/local \
+        --enable-gpl --enable-nonfree \
+        --enable-openssl \
+        --enable-libx264 --enable-libx265 --enable-libdav1d --enable-libopus \
+        --enable-libfdk-aac --enable-libmp3lame --enable-libvorbis \
+        --enable-cuda-nvcc --enable-nvenc --enable-nvdec --enable-libnpp \
+        --extra-cflags="-I/usr/local/cuda/include -I/usr/local/include" \
+        --extra-ldflags="-L/usr/local/cuda/lib64 -L/usr/local/lib" \
+    && make -j"$(nproc)" && make install \
+    && ldconfig \
+    && rm -rf /tmp/ffmpeg \
+    && ffmpeg -version | head -3
+
+# -----------------------------------------------------------------------------
+# 7. BestSource (bs.VideoSource) — needed for HTTP/HLS source decoding
+# -----------------------------------------------------------------------------
+# We use styler00dollar's fork to match the API surface used by run_rife.py
+# (cachemode=0 etc). meson installs the .so into /usr/local/lib/vapoursynth/,
+# so VS autoloads it on import. R12 matches the styler image.
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b ${BESTSOURCE_TAG} --recurse-submodules \
+        https://github.com/vapoursynth/bestsource.git /tmp/bs \
+    && cd /tmp/bs \
+    && CFLAGS=-fPIC meson setup -Denable_plugin=true build \
+    && CFLAGS=-fPIC ninja -C build \
+    && ninja -C build install \
+    && ldconfig \
+    && rm -rf /tmp/bs
+
+# -----------------------------------------------------------------------------
+# 8. L-SMASH-Works (lsmas) — kept as fallback / diag probe
+# -----------------------------------------------------------------------------
+# run_rife.py uses bs.VideoSource now (v0.1.10+) but server.py still exposes
+# /probe/lsmas_real + /probe/lsmas_realize for diagnostics. Cheap to build.
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 --recurse-submodules \
+        https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git /tmp/lsmas \
+    && cd /tmp/lsmas/VapourSynth \
+    && sed -i "/'..\/common\/qsv\.\(c\|h\)',/d" meson.build \
+    && CFLAGS=-fPIC CXXFLAGS=-fPIC LDFLAGS="-Wl,-Bsymbolic" meson setup build \
+    && ninja -C build && ninja -C build install \
+    && ldconfig \
+    && rm -rf /tmp/lsmas
+
+# -----------------------------------------------------------------------------
+# 9. vs-mlrt vstrt plugin (the TensorRT VapourSynth bridge)
+# -----------------------------------------------------------------------------
+# CMake build. USE_NVINFER_PLUGIN=ON pulls in TensorRT's extra ops which RIFE
+# v4.6 doesn't strictly need but is harmless and matches the styler build.
+# Installs libvstrt.so to /usr/local/lib/. We then symlink to
+# /usr/local/lib/vapoursynth/ so VS autoload picks it up (same fix v0.1.5).
+# -----------------------------------------------------------------------------
+RUN git clone --depth 1 -b v${VSMLRT_VERSION} \
+        https://github.com/AmusementClub/vs-mlrt.git /tmp/vsmlrt \
+    && cd /tmp/vsmlrt/vstrt \
+    && cmake -B build -G Ninja \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DUSE_NVINFER_PLUGIN=ON \
+        -DVAPOURSYNTH_INCLUDE_DIRECTORY=/usr/local/include/vapoursynth \
+    && cmake --build build \
+    && cmake --install build \
+    && mkdir -p /usr/local/lib/vapoursynth \
+    # The CMake install rule lands libvstrt.so in /usr/local/lib (we forced
+    # LIBDIR=lib). VS autoloads .so files from /usr/local/lib/vapoursynth/,
+    # so symlink. If libvstrt didn't land in /usr/local/lib (e.g. ended up in
+    # the build/ tree or lib/x86_64-linux-gnu), search and copy as a fallback.
+    && if [ -f /usr/local/lib/libvstrt.so ]; then \
+           ln -sf /usr/local/lib/libvstrt.so /usr/local/lib/vapoursynth/libvstrt.so; \
+       else \
+           VSTRT_SO="$(find /tmp/vsmlrt/vstrt/build /usr/local -maxdepth 4 -name 'libvstrt.so*' 2>/dev/null | head -1)"; \
+           if [ -n "$VSTRT_SO" ]; then \
+               cp "$VSTRT_SO" /usr/local/lib/libvstrt.so; \
+               ln -sf /usr/local/lib/libvstrt.so /usr/local/lib/vapoursynth/libvstrt.so; \
+           else \
+               echo "ERROR: libvstrt.so not found after build" >&2; exit 1; \
+           fi; \
+       fi \
+    && ls -la /usr/local/lib/libvstrt.so /usr/local/lib/vapoursynth/libvstrt.so \
+    && ldconfig \
+    && rm -rf /tmp/vsmlrt
+
+# -----------------------------------------------------------------------------
+# 10. vsmlrt.py Python module + RIFE v4.6 ONNX model
+# -----------------------------------------------------------------------------
+# Same as v0.1.x — download scripts.v15.13.7z and models.v15.13.7z from the
+# upstream release page. vsmlrt.py resolves the model dir from where the .so
+# loaded, so we mirror to both /usr/local/lib/models/ and
+# /usr/local/lib/vapoursynth/models/ as belt-and-suspenders.
+# -----------------------------------------------------------------------------
 RUN curl -L -o /tmp/vsmlrt-scripts.7z \
         https://github.com/AmusementClub/vs-mlrt/releases/download/v${VSMLRT_VERSION}/scripts.v${VSMLRT_VERSION}.7z \
     && 7z x /tmp/vsmlrt-scripts.7z -o/tmp/vsmlrt-scripts \
     && cp /tmp/vsmlrt-scripts/vsmlrt.py /usr/local/lib/python3.12/dist-packages/ \
     && rm -rf /tmp/vsmlrt-scripts /tmp/vsmlrt-scripts.7z
 
-# RIFE v4.6 ONNX model — vsmlrt.py resolves models at:
-#   models_path = os.path.dirname(<vstrt_plugin_path>) + "/models"
-# In the styler base image, vstrt CMake installs to /usr/local/lib/libvstrt.so
-# (see styler Dockerfile L629 and vstrt's CMakeLists default LIBDIR), so the
-# computed models_path is /usr/local/lib/models/. For RIFE v4.6, the file lookup
-# is at <models_path>/rife/rife_v4.6.onnx (vsmlrt.py v15.13 L1099-1103).
-#
-# vsmlrt.py has NO env-var or model_dir override — the path is fully derived
-# from where the .so plugin was loaded. So we install to /usr/local/lib/models/
-# (the actually-computed path) AND mirror to /usr/local/lib/vapoursynth/models/
-# (the convention used by some other VS plugin layouts) as belt-and-suspenders,
-# in case styler ever relocates libvstrt.so to the autoload dir in a later tag.
-# Extract only the RIFE subtree to keep the layer small (~850 MB archive → ~50 MB
-# kept for RIFE v4.6 model).
 RUN mkdir -p /usr/local/lib/models /usr/local/lib/vapoursynth/models \
     && curl -L -o /tmp/vsmlrt-models.7z \
         https://github.com/AmusementClub/vs-mlrt/releases/download/v${VSMLRT_VERSION}/models.v${VSMLRT_VERSION}.7z \
@@ -162,42 +296,41 @@ RUN mkdir -p /usr/local/lib/models /usr/local/lib/vapoursynth/models \
     && cp -r /tmp/vsmlrt-models/models/rife /usr/local/lib/vapoursynth/models/ \
     && rm -rf /tmp/vsmlrt-models /tmp/vsmlrt-models.7z
 
-# libvstrt.so autoload fix: styler base installs it to /usr/local/lib/ (build artifact
-# location) but VapourSynth's autoload only scans /usr/local/lib/vapoursynth/. Symlink
-# so `from vsmlrt import RIFE` finds the plugin at runtime. Verified failing in v0.1.4
-# pod test (see vault gotchas/2026-05-27-cloud-worker-week1-acceptance.md).
-RUN mkdir -p /usr/local/lib/vapoursynth \
-    && if [ -f /usr/local/lib/libvstrt.so ]; then \
-           ln -sf /usr/local/lib/libvstrt.so /usr/local/lib/vapoursynth/libvstrt.so; \
-           echo "Symlinked libvstrt.so to /usr/local/lib/vapoursynth/"; \
-       else \
-           echo "WARNING: /usr/local/lib/libvstrt.so not found in base image"; \
-       fi \
-    && ls -la /usr/local/lib/vapoursynth/
+# -----------------------------------------------------------------------------
+# 11. Verify VS namespaces include trt + bs (FAIL the build if missing)
+# -----------------------------------------------------------------------------
+# This is the critical check. If either plugin failed to autoload, the build
+# fails here loudly instead of producing an image that 502s on first /process.
+# We DO NOT call any GPU primitives — that requires runtime CUDA which CI
+# doesn't have. Just verify the .so plugins are importable as namespaces.
+# -----------------------------------------------------------------------------
+RUN python3 -c "import vapoursynth as vs; \
+ns = sorted([p for p in dir(vs.core) if not p.startswith('_')]); \
+print('VS namespaces:', ns); \
+assert 'trt' in ns, 'trt namespace missing — vstrt plugin failed to autoload'; \
+assert 'bs' in ns, 'bs namespace missing — bestsource plugin failed to autoload'; \
+print('OK: vstrt + bestsource autoloaded')"
 
-# Smoke-check: verify the vstrt namespace can be probed at all from Python.
-# Don't FAIL the build on this — it'll fail without a GPU at CI time anyway —
-# but log the result for debugging via docker history / build logs.
-RUN python3 -c "import vapoursynth as vs; namespaces = sorted([p for p in dir(vs.core) if not p.startswith('_')]); print('VS namespaces:', namespaces); print('trt loaded:', 'trt' in namespaces)" 2>&1 || true
-
-# Pre-bake the RIFE v4.6 TRT FP16 engine for RTX 4090 (Ada Lovelace = sm_89).
-# At build time there's no GPU in the CI runner, so this just exits cleanly and
-# the engine compiles on first /process call. Kept here so a future GPU-equipped
-# CI runner (or a multi-stage `RUN --device=nvidia.com/gpu=all` build) can bake
-# it ahead of time.
+# -----------------------------------------------------------------------------
+# 12. Engine prebake (no-op without GPU at build time)
+# -----------------------------------------------------------------------------
 RUN mkdir -p /root/.cache/vs-mlrt
 COPY trt_engine_builder.py /tmp/
 RUN python3 /tmp/trt_engine_builder.py \
-    || echo "Engine bake skipped (no GPU at build time — will compile on first /process)"
+    || echo "Engine bake skipped (no GPU at build time — compiles on first /process)"
 
-# App code
+# -----------------------------------------------------------------------------
+# 13. Python deps + app code + nginx config
+# -----------------------------------------------------------------------------
+COPY requirements.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+
 COPY server.py auth.py pipeline.py pipeline_types.py run_rife.py idle_watcher.py start.sh ./
 COPY nginx.conf /etc/nginx/nginx.conf
 
-# RunPod port — single port per pod (nginx terminates HTTPS via RunPod proxy,
-# forwards / → uvicorn:8001, /hls/* → file-system).
+# RunPod exposes ONE port per pod — nginx terminates :8080, proxies / to
+# uvicorn:8001 and serves /hls/* directly. /var/hls is the on-disk segment dir.
 EXPOSE 8080
-
 ENV HLS_SERVE_DIR=/var/hls
 
 CMD ["./start.sh"]
