@@ -212,3 +212,56 @@ def test_start_after_failed_wipes_output_dir(tmp_path):
 
     block.set()
     m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+
+def test_playlist_ready_false_during_running_with_no_segments(tmp_path):
+    block = threading.Event()
+
+    def fake_pipeline(**kwargs):
+        block.wait(timeout=5)
+        from pipeline_types import PipelineResult
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    m.start(source_url="https://test.m3u8", headers=None)
+    assert m.status()["playlist_ready"] is False
+    assert m.status()["n_segments"] == 0
+
+    block.set()
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+
+def test_playlist_ready_true_once_any_segment_exists(tmp_path):
+    block = threading.Event()
+
+    def fake_pipeline(**kwargs):
+        # Touch a non-zero segment file then block.
+        (tmp_path / "segment_002.ts").write_bytes(b"x" * 1024)
+        block.wait(timeout=5)
+        from pipeline_types import PipelineResult
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    m.start(source_url="https://test.m3u8", headers=None)
+    # Poll briefly: the fake creates the file then blocks; we should see ready
+    # within ~100ms.
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        s = m.status()
+        if s["playlist_ready"]:
+            break
+        time.sleep(0.02)
+    s = m.status()
+    assert s["playlist_ready"] is True, "should flip True for segment_002.ts (no segment_000 reliance)"
+    assert s["n_segments"] == 1
+
+    block.set()
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
