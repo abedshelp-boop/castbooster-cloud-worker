@@ -58,7 +58,6 @@ def test_process_starts_pipeline_and_returns_hls_url(client, monkeypatch):
     assert fake_calls[0]["source_url"] == "https://egydead.example/anime.m3u8"
 
 
-@pytest.mark.skip(reason="needs /process_status endpoint — unskipped in Task 14")
 def test_process_pipeline_failure_surfaces_via_process_status(client, monkeypatch):
     """v0.3.0: /process always returns 200 on successful start. Pipeline
     failures (rc != 0 or exceptions) surface via /process_status as

@@ -95,3 +95,86 @@ def test_process_returns_409_when_pipeline_already_running(client_and_manager):
     assert body["started_at"] is not None
 
     block.set()
+
+
+def test_process_status_returns_idle_on_fresh_server(client_and_manager):
+    c, _ = client_and_manager
+    r = c.get("/process_status", headers={"Authorization": "Bearer test-key-async"})
+    assert r.status_code == 200
+    s = r.json()
+    assert s["state"] == "idle"
+    assert s["hls_url"] == "https://fake-pod-8080.proxy.runpod.net/hls/playlist.m3u8"
+    assert s["source_url"] is None
+    assert s["started_at"] is None
+    assert s["playlist_ready"] is False
+    assert s["n_segments"] == 0
+    assert s["error_type"] is None
+
+
+def test_process_status_running_while_thread_is_alive(client_and_manager):
+    c, install = client_and_manager
+    block = threading.Event()
+
+    def slow_pipeline(**kwargs):
+        block.wait(timeout=5)
+        from pipeline_types import PipelineResult
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    install(slow_pipeline)
+    c.post("/process", headers={"Authorization": "Bearer test-key-async"}, json={"source_url": "https://x.m3u8"})
+
+    s1 = c.get("/process_status", headers={"Authorization": "Bearer test-key-async"}).json()
+    assert s1["state"] == "running"
+    assert s1["source_url"] == "https://x.m3u8"
+    assert s1["elapsed_s"] >= 0
+    time.sleep(0.05)
+    s2 = c.get("/process_status", headers={"Authorization": "Bearer test-key-async"}).json()
+    assert s2["elapsed_s"] >= s1["elapsed_s"], "elapsed_s must be monotonic"
+
+    block.set()
+
+
+def test_process_status_failed_after_thread_raise(client_and_manager):
+    from server import app
+    c, install = client_and_manager
+
+    def boom(**kwargs):
+        raise RuntimeError("native segfault simulation")
+
+    install(boom)
+    c.post("/process", headers={"Authorization": "Bearer test-key-async"}, json={"source_url": "https://x.m3u8"})
+    app.state.pipeline_manager._thread.join(timeout=5)  # type: ignore[attr-defined]
+    s = c.get("/process_status", headers={"Authorization": "Bearer test-key-async"}).json()
+    assert s["state"] == "failed"
+    assert s["error_type"] == "RuntimeError"
+    assert "native segfault simulation" in s["error_msg"]
+    assert s["traceback"] is not None and "RuntimeError" in s["traceback"]
+
+
+def test_process_status_reports_playlist_ready_once_segment_exists(client_and_manager, tmp_path):
+    c, install = client_and_manager
+    block = threading.Event()
+    hls_dir = tmp_path / "hls"  # matches env fixture
+
+    def slow_pipeline(**kwargs):
+        # Create a non-zero segment then block, so status() observes RUNNING
+        # + playlist_ready=True.
+        (hls_dir / "segment_005.ts").write_bytes(b"x" * 4096)
+        block.wait(timeout=5)
+        from pipeline_types import PipelineResult
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    install(slow_pipeline)
+    c.post("/process", headers={"Authorization": "Bearer test-key-async"}, json={"source_url": "https://x.m3u8"})
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        s = c.get("/process_status", headers={"Authorization": "Bearer test-key-async"}).json()
+        if s["playlist_ready"]:
+            break
+        time.sleep(0.02)
+    s = c.get("/process_status", headers={"Authorization": "Bearer test-key-async"}).json()
+    assert s["playlist_ready"] is True
+    assert s["n_segments"] == 1
+
+    block.set()

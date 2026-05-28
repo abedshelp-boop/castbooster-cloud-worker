@@ -359,6 +359,17 @@ def process(req: ProcessRequest):
     )
 
 
+@app.get("/process_status", dependencies=[Depends(require_api_key)])
+def process_status():
+    """Snapshot of the background pipeline thread's state.
+
+    Used by the laptop orchestrator (Task 16) to gate Chromecast playback
+    on playlist_ready and to surface pipeline failures back to the user.
+    """
+    mgr: PipelineManager = app.state.pipeline_manager
+    return mgr.status()
+
+
 @app.post("/stop", dependencies=[Depends(require_api_key)])
 async def stop():
     _log("/stop HIT")
