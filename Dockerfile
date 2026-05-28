@@ -148,6 +148,28 @@ RUN git clone --depth 1 -b ${VS_VERSION} https://github.com/vapoursynth/vapoursy
     && rm -rf /tmp/vs
 
 # -----------------------------------------------------------------------------
+# 4b. Symlink VapourSynth Python binding into dist-packages
+# -----------------------------------------------------------------------------
+# VapourSynth's autotools install lands the Python module in
+# /usr/local/lib/python3.12/site-packages/, but Ubuntu 24.04's Python only adds
+# /usr/local/lib/python3.12/dist-packages/ to sys.path by default. Without this
+# bridge, `import vapoursynth` fails even though the .so is on disk — which is
+# exactly what blew up the v0.2.2 verification step.
+#
+# Use symlinks (ln -sf) not copies — preserves the upstream install location
+# and keeps the layer small. The trailing python3 -c verification fails the
+# build immediately if the symlink doesn't resolve, giving fast-fail instead of
+# waiting until the step-11 namespace assertion.
+# -----------------------------------------------------------------------------
+RUN mkdir -p /usr/local/lib/python3.12/dist-packages \
+    && for f in /usr/local/lib/python3.12/site-packages/vapoursynth*; do \
+           if [ -e "$f" ]; then \
+               ln -sf "$f" "/usr/local/lib/python3.12/dist-packages/$(basename $f)"; \
+           fi; \
+       done \
+    && python3 -c "import vapoursynth as vs; print('VS imported OK, core:', vs.core)"
+
+# -----------------------------------------------------------------------------
 # 5. TensorRT 10.7.0.23 (tarball install — apt repo is broken for CUDA 12)
 # -----------------------------------------------------------------------------
 # Why the tarball: NVIDIA's apt repo for libnvinfer10 has unmet-dep bugs on
