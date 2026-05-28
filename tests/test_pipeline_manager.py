@@ -112,3 +112,30 @@ def test_thread_raises_transitions_to_failed(tmp_path):
     assert "boom" in s["error_msg"]
     assert s["traceback"] is not None
     assert "RuntimeError" in s["traceback"]
+
+
+def test_second_start_while_running_returns_already_running(tmp_path):
+    block = threading.Event()
+
+    def fake_pipeline(**kwargs):
+        block.wait(timeout=5)
+        from pipeline_types import PipelineResult
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    first = m.start(source_url="https://first.m3u8", headers=None)
+    assert first.success is True
+
+    second = m.start(source_url="https://second.m3u8", headers=None)
+    assert second.success is False
+    assert second.snapshot["state"] == "running"
+    assert second.snapshot["source_url"] == "https://first.m3u8", (
+        "second.snapshot must report the CURRENTLY running pipeline, not the rejected one"
+    )
+
+    block.set()
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
