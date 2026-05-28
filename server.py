@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from auth import require_api_key
 from idle_watcher import IdleWatcher
+from pipeline_manager import PipelineManager, PipelineState
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
@@ -1236,12 +1237,22 @@ def probe_process_short(
 
 
 @app.on_event("startup")
-def _start_idle_watcher():
+def _on_startup():
     global _watcher
     _log("STARTUP", pid=os.getpid(), python=sys.version.split()[0])
+
+    # Pipeline manager — always created, even in DISABLE_IDLE_WATCHER mode,
+    # because /process and /process_status read from it.
+    app.state.pipeline_manager = PipelineManager(
+        output_dir=_hls_dir(),
+        public_base_url=_public_base_url(),
+        run_pipeline=run_pipeline_for_request,
+    )
+    _log("STARTUP pipeline_manager ready", output_dir=str(_hls_dir()))
+
     if os.environ.get("DISABLE_IDLE_WATCHER") == "1":
         _log("STARTUP idle_watcher disabled (DISABLE_IDLE_WATCHER=1)")
-        return  # tests
+        return
     _watcher = IdleWatcher(
         watch_dir=_hls_dir(),
         idle_seconds=10 * 60,
