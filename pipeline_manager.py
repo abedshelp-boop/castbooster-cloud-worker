@@ -178,9 +178,13 @@ class PipelineManager:
                 extra_input_headers=headers,
             )
         except BaseException as exc:
-            # Exception path lands in Task 5 — for now, re-raise so the test
-            # in Task 4 can be added and we keep TDD discipline.
-            raise
+            with self._lock:
+                if self._state is PipelineState.RUNNING:
+                    self._state = PipelineState.FAILED
+                    self._error_type = type(exc).__name__
+                    self._error_msg = str(exc)[:1500]
+                    self._traceback = traceback.format_exc()[-2000:]
+            return
         with self._lock:
             if self._state is PipelineState.RUNNING:
                 self._result = result

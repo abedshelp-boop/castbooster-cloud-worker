@@ -92,3 +92,23 @@ def test_completion_rc_nonzero_transitions_to_failed(tmp_path):
     assert s["error_type"] == "PipelineNonZeroExit"
     assert "returncode=2" in s["error_msg"]
     assert "Couldn't open URL" in s["stderr_tail"]
+
+
+def test_thread_raises_transitions_to_failed(tmp_path):
+    def fake_pipeline(**kwargs):
+        raise RuntimeError("boom — vapoursynth.so segfault simulated")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    m.start(source_url="https://test.m3u8", headers=None)
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+    s = m.status()
+    assert s["state"] == "failed"
+    assert s["error_type"] == "RuntimeError"
+    assert "boom" in s["error_msg"]
+    assert s["traceback"] is not None
+    assert "RuntimeError" in s["traceback"]
