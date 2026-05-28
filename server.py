@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.2.6")
+app = FastAPI(title="castbooster-cloud-worker", version="0.2.7")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -1065,6 +1065,170 @@ def probe_trtexec():
         "ldd_trtexec_real": _ldd("/usr/local/bin/trtexec.real"),
         "ldd_trtexec": _ldd("/usr/local/bin/trtexec"),
     }
+
+
+# -----------------------------------------------------------------------------
+# v0.2.7 PROCESS-SHORT PROBE — added 2026-05-28. v0.2.6 /process call gets a
+# CF 504 at 60s, but no HLS segments ever appear at /hls/playlist.m3u8 even
+# after 15+ min. We can't view pod stdout/stderr (RunPod doesn't expose logs
+# via API), so we need a probe that:
+#   (a) runs the same pipeline as /process but trimmed to a few seconds of frames
+#   (b) captures ffmpeg stdout/stderr in the JSON response
+#   (c) lists the HLS output dir contents so we know what got written
+# /process_short builds the same VS graph as run_rife._build_clip(), trims to
+# N frames (default 60 = 0.5s of output), pipes to ffmpeg with the same
+# command, and returns everything inline.
+# -----------------------------------------------------------------------------
+
+@app.get("/probe/process_short", dependencies=[Depends(require_api_key)])
+def probe_process_short(
+    url: str = "http://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+    n_frames: int = 60,
+    use_trt: bool = True,
+):
+    """Run a short version of /process and return ffmpeg's stderr + output dir
+    contents. Used to debug why /process never writes segments."""
+    import shutil
+    import subprocess
+    import time
+    import traceback as _tb
+    from pathlib import Path
+
+    _log("/probe/process_short ENTER", url=url[:200], n_frames=n_frames, use_trt=use_trt)
+    out_dir = Path("/var/hls_probe")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    playlist = out_dir / "playlist.m3u8"
+    segment_pattern = out_dir / "segment_%03d.ts"
+
+    result: dict = {
+        "url": url,
+        "n_frames": n_frames,
+        "use_trt": use_trt,
+        "out_dir": str(out_dir),
+    }
+
+    # Stage 1: build the clip graph, same as run_rife but trimmed to n_frames
+    t0 = time.monotonic()
+    try:
+        import vapoursynth as vs
+        from vsmlrt import RIFE, Backend
+        core = vs.core
+        src = core.bs.VideoSource(source=url, cachemode=0)
+        src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s="709")
+        pad_w = (32 - src.width % 32) % 32
+        pad_h = (32 - src.height % 32) % 32
+        if pad_w or pad_h:
+            src = core.std.AddBorders(src, right=pad_w, bottom=pad_h)
+        backend = Backend.TRT(fp16=True, num_streams=2) if use_trt else Backend.ORT_CUDA(fp16=True)
+        clip = RIFE(src, multi=2, model=46, backend=backend)
+        if pad_w or pad_h:
+            clip = core.std.Crop(clip, right=pad_w, bottom=pad_h)
+        clip = core.resize.Bilinear(clip, format=vs.YUV420P8, matrix_s="709")
+        # Trim to first N frames of the RIFE OUTPUT (so we encode quickly)
+        clip = core.std.Trim(clip, first=0, last=n_frames - 1)
+        result["clip_built_s"] = round(time.monotonic() - t0, 2)
+        result["clip_num_frames"] = clip.num_frames
+        result["clip_fps_num"] = clip.fps_num
+        result["clip_fps_den"] = clip.fps_den
+        result["clip_w"] = clip.width
+        result["clip_h"] = clip.height
+    except BaseException as e:
+        result["ok"] = False
+        result["stage"] = "build_clip"
+        result["error_type"] = type(e).__name__
+        result["error_msg"] = str(e)[:1000]
+        result["traceback"] = _tb.format_exc()[-2000:]
+        return result
+
+    # Stage 2: spawn ffmpeg, pipe clip.output() into stdin
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "yuv4mpegpipe",
+        "-i", "-",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-tune", "ll",
+        "-b:v", "8M",
+        "-maxrate", "12M",
+        "-bufsize", "16M",
+        "-pix_fmt", "yuv420p",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "0",  # keep all segments for inspection
+        "-hls_flags", "independent_segments",
+        "-hls_segment_filename", str(segment_pattern),
+        str(playlist),
+    ]
+    result["ffmpeg_cmd"] = " ".join(ffmpeg_cmd)
+
+    t1 = time.monotonic()
+    ffmpeg_proc = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        clip.output(ffmpeg_proc.stdin, y4m=True)
+        ffmpeg_proc.stdin.close()
+        result["clip_output_done_s"] = round(time.monotonic() - t1, 2)
+        # Wait up to 60s for ffmpeg to finish (small clip should be quick)
+        stdout_b, stderr_b = ffmpeg_proc.communicate(timeout=120)
+        result["ffmpeg_returncode"] = ffmpeg_proc.returncode
+        result["ffmpeg_stdout_tail"] = stdout_b.decode(errors="replace")[-2000:]
+        result["ffmpeg_stderr_tail"] = stderr_b.decode(errors="replace")[-3000:]
+        result["total_pipeline_s"] = round(time.monotonic() - t0, 2)
+    except subprocess.TimeoutExpired:
+        ffmpeg_proc.kill()
+        try:
+            stdout_b, stderr_b = ffmpeg_proc.communicate(timeout=5)
+            result["ffmpeg_stdout_tail"] = stdout_b.decode(errors="replace")[-2000:]
+            result["ffmpeg_stderr_tail"] = stderr_b.decode(errors="replace")[-3000:]
+        except Exception:
+            pass
+        result["ok"] = False
+        result["stage"] = "ffmpeg_timeout"
+        result["error_msg"] = "ffmpeg.communicate() timed out at 120s"
+    except BaseException as e:
+        try:
+            ffmpeg_proc.kill()
+            stdout_b, stderr_b = ffmpeg_proc.communicate(timeout=5)
+            result["ffmpeg_stdout_tail"] = stdout_b.decode(errors="replace")[-2000:]
+            result["ffmpeg_stderr_tail"] = stderr_b.decode(errors="replace")[-3000:]
+        except Exception:
+            pass
+        result["ok"] = False
+        result["stage"] = "clip_output_or_ffmpeg"
+        result["error_type"] = type(e).__name__
+        result["error_msg"] = str(e)[:1000]
+        result["traceback"] = _tb.format_exc()[-2000:]
+
+    # Stage 3: list the output dir to see what got written
+    files = []
+    try:
+        for p in sorted(out_dir.iterdir()):
+            files.append({
+                "name": p.name,
+                "size": p.stat().st_size,
+            })
+    except Exception as e:
+        files = [{"error": f"{type(e).__name__}: {e}"}]
+    result["hls_files"] = files
+    if "ok" not in result:
+        # Determine success: ffmpeg rc==0 AND playlist exists AND at least 1 segment
+        playlist_exists = any(f.get("name") == "playlist.m3u8" for f in files)
+        segs = [f for f in files if str(f.get("name", "")).startswith("segment_") and str(f.get("name", "")).endswith(".ts") and f.get("size", 0) > 0]
+        result["ok"] = (
+            result.get("ffmpeg_returncode") == 0
+            and playlist_exists
+            and len(segs) > 0
+        )
+        result["segments_written"] = len(segs)
+
+    return result
 
 
 @app.on_event("startup")
