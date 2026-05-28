@@ -104,10 +104,18 @@ def run_rife(
     """Run RIFE v4.6 TRT FP16 pipeline using Python-direct VS API.
 
     Args:
-        source_url: source HLS URL (http://... or https://...)
+        source_url: source URL fed to BestSource. As of v0.3.1 (Pillar 3.6)
+            this is normally the loopback /source_proxy URL chosen by
+            server.py, so HTTP headers get injected at the proxy layer
+            (BestSource's Python API doesn't accept libavformat options).
+            Tests / callers that don't need headers can still pass a raw
+            http(s):// URL — BestSource handles those natively.
         output_dir: directory for HLS playlist + .ts segments
         timeout_s: kill pipeline if it runs longer than this
-        extra_input_headers: NOT supported in this pipeline yet (see below)
+        extra_input_headers: if non-empty, the CRLF guard runs against
+            the values. The headers themselves aren't threaded through —
+            v0.3.1 expects callers to register them with the SourceRegistry
+            and use the loopback /source_proxy URL instead.
 
     Returns:
         PipelineResult with returncode, stdout, stderr
@@ -118,20 +126,15 @@ def run_rife(
     playlist = output_dir / "playlist.m3u8"
     segment_pattern = output_dir / "segment_%03d.ts"
 
-    # CRLF injection guard kept for defense-in-depth even though headers are
-    # rejected below — if Phase 2 wires headers through lsmas format_opts, the
-    # guard already exists and catches malformed input upstream.
+    # CRLF injection guard — defense-in-depth. Pre-v0.3.1 we also raised
+    # NotImplementedError if headers were non-empty; now the canonical
+    # path is /source_proxy + loopback URL, so callers don't need to pass
+    # headers in here at all. If they do, we just sanity-check the values.
     if extra_input_headers:
         for k, v in extra_input_headers.items():
             if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
                 print(f"[run_rife] CRLF guard tripped on header {k!r}", flush=True)
                 raise ValueError(f"header {k!r} contains CR/LF (injection attempt)")
-        print(f"[run_rife] extra_input_headers passed but not yet supported", flush=True)
-        raise NotImplementedError(
-            "extra_input_headers not supported in RIFE pipeline yet — "
-            "vapoursynth/lsmas reads the source, not ffmpeg. "
-            "Phase 2: thread headers via lsmas format_opts."
-        )
 
     # Build the clip graph
     print(f"[run_rife] Building VS clip graph...", flush=True)

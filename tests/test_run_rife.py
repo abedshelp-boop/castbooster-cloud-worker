@@ -84,20 +84,13 @@ def test_run_rife_returns_failure_on_ffmpeg_nonzero(tmp_path, monkeypatch):
     assert "nvenc init failed" in result.stderr
 
 
-def test_run_rife_rejects_extra_input_headers(tmp_path, monkeypatch):
-    """Non-empty headers should raise NotImplementedError (Phase 2)."""
-    from run_rife import run_rife
+def test_run_rife_crlf_guard_still_fires(tmp_path):
+    """CRLF in any header value raises ValueError.
 
-    with pytest.raises(NotImplementedError, match="extra_input_headers"):
-        run_rife(
-            source_url="https://example.com/x.m3u8",
-            output_dir=tmp_path,
-            extra_input_headers={"Cookie": "session=abc"},
-        )
-
-
-def test_run_rife_crlf_guard_fires_before_notimplemented(tmp_path):
-    """CRLF in headers should raise ValueError (caught earlier than NIE)."""
+    v0.3.1: the NotImplementedError branch is gone (headers are now
+    handled by /source_proxy + loopback URL), but the CRLF guard stays
+    as defense-in-depth.
+    """
     from run_rife import run_rife
 
     with pytest.raises(ValueError, match="CR/LF"):
@@ -106,6 +99,32 @@ def test_run_rife_crlf_guard_fires_before_notimplemented(tmp_path):
             output_dir=tmp_path,
             extra_input_headers={"X-Bad": "value\r\nX-Smuggled: pwned"},
         )
+
+
+def test_run_rife_accepts_non_crlf_headers(tmp_path, monkeypatch):
+    """v0.3.1: non-empty headers without CRLF must NOT raise. The
+    NotImplementedError branch from v0.3.0 is gone — callers pre-register
+    headers with the SourceRegistry and pass the loopback URL.
+    """
+    from run_rife import run_rife
+
+    _make_fake_clip(monkeypatch)
+
+    fake_ffmpeg = MagicMock()
+    fake_ffmpeg.returncode = 0
+    fake_ffmpeg.stdout.read.return_value = b""
+    fake_ffmpeg.stderr.read.return_value = b""
+    fake_ffmpeg.wait.return_value = 0
+    fake_ffmpeg.stdin = MagicMock()
+    monkeypatch.setattr("subprocess.Popen", lambda cmd, **kw: fake_ffmpeg)
+
+    # Should run end-to-end without raising NotImplementedError.
+    result = run_rife(
+        source_url="http://127.0.0.1:8001/source_proxy?token=fake",
+        output_dir=tmp_path,
+        extra_input_headers={"Cookie": "session=abc"},  # values OK
+    )
+    assert result.returncode == 0
 
 
 def test_run_rife_clip_build_failure_returns_2(tmp_path, monkeypatch):
