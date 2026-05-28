@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.2.7")
+app = FastAPI(title="castbooster-cloud-worker", version="0.2.8")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -1175,8 +1175,12 @@ def probe_process_short(
         clip.output(ffmpeg_proc.stdin, y4m=True)
         ffmpeg_proc.stdin.close()
         result["clip_output_done_s"] = round(time.monotonic() - t1, 2)
-        # Wait up to 60s for ffmpeg to finish (small clip should be quick)
-        stdout_b, stderr_b = ffmpeg_proc.communicate(timeout=120)
+        # v0.2.8: use manual drain + wait instead of communicate() because
+        # ffmpeg_proc.communicate() raises "ValueError: flush of closed file"
+        # when stdin has been closed manually (confirmed v0.2.7 probe).
+        stdout_b = ffmpeg_proc.stdout.read() if ffmpeg_proc.stdout else b""
+        stderr_b = ffmpeg_proc.stderr.read() if ffmpeg_proc.stderr else b""
+        ffmpeg_proc.wait(timeout=120)
         result["ffmpeg_returncode"] = ffmpeg_proc.returncode
         result["ffmpeg_stdout_tail"] = stdout_b.decode(errors="replace")[-2000:]
         result["ffmpeg_stderr_tail"] = stderr_b.decode(errors="replace")[-3000:]

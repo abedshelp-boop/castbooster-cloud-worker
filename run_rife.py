@@ -153,7 +153,14 @@ def run_rife(
         clip.output(ffmpeg_proc.stdin, y4m=True)
         ffmpeg_proc.stdin.close()
         print(f"[run_rife] clip.output() returned; waiting for ffmpeg...", flush=True)
-        stdout_bytes, stderr_bytes = ffmpeg_proc.communicate(timeout=timeout_s)
+        # v0.2.8: ffmpeg_proc.communicate() raises "ValueError: flush of closed
+        # file" because we already closed stdin above. communicate() internally
+        # calls self.stdin.flush() and chokes on an already-closed pipe. Use
+        # manual drain + wait instead. Confirmed by /probe/process_short in
+        # v0.2.7 — error: subprocess.py:2067 self.stdin.flush() ValueError.
+        stdout_bytes = ffmpeg_proc.stdout.read() if ffmpeg_proc.stdout else b""
+        stderr_bytes = ffmpeg_proc.stderr.read() if ffmpeg_proc.stderr else b""
+        ffmpeg_proc.wait(timeout=timeout_s)
         rc = ffmpeg_proc.returncode
         print(f"[run_rife] ffmpeg returncode={rc}", flush=True)
         return PipelineResult(
@@ -165,7 +172,7 @@ def run_rife(
         print(f"[run_rife] timeout after {timeout_s}s; killing ffmpeg", flush=True)
         ffmpeg_proc.kill()
         try:
-            ffmpeg_proc.communicate(timeout=5)
+            ffmpeg_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
         return PipelineResult(
@@ -176,10 +183,10 @@ def run_rife(
     except Exception as e:
         # clip.output() raises if VS error during processing (e.g. RIFE crash,
         # OOM, source fetch fail). Always kill ffmpeg, surface the error.
-        print(f"[run_rife] EXCEPTION in clip.output() / communicate: {type(e).__name__}: {e}", flush=True)
+        print(f"[run_rife] EXCEPTION in clip.output() / wait: {type(e).__name__}: {e}", flush=True)
         try:
             ffmpeg_proc.kill()
-            ffmpeg_proc.communicate(timeout=5)
+            ffmpeg_proc.wait(timeout=5)
         except Exception:
             pass
         return PipelineResult(

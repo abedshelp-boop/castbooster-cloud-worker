@@ -26,7 +26,13 @@ def test_run_rife_calls_ffmpeg_with_nvenc(tmp_path, monkeypatch):
 
     fake_ffmpeg = MagicMock()
     fake_ffmpeg.returncode = 0
-    fake_ffmpeg.communicate.return_value = (b"", b"")
+    # v0.2.8: run_rife now uses stdout.read() / stderr.read() / wait()
+    # instead of communicate() — see comment in run_rife.py about
+    # "ValueError: flush of closed file" when stdin is closed before
+    # communicate is called.
+    fake_ffmpeg.stdout.read.return_value = b""
+    fake_ffmpeg.stderr.read.return_value = b""
+    fake_ffmpeg.wait.return_value = 0
     fake_ffmpeg.stdin = MagicMock()
 
     popen_calls = []
@@ -61,7 +67,10 @@ def test_run_rife_returns_failure_on_ffmpeg_nonzero(tmp_path, monkeypatch):
 
     fake_ffmpeg = MagicMock()
     fake_ffmpeg.returncode = 1
-    fake_ffmpeg.communicate.return_value = (b"", b"nvenc init failed")
+    # v0.2.8: same API change as the success-case test above
+    fake_ffmpeg.stdout.read.return_value = b""
+    fake_ffmpeg.stderr.read.return_value = b"nvenc init failed"
+    fake_ffmpeg.wait.return_value = 1
     fake_ffmpeg.stdin = MagicMock()
 
     monkeypatch.setattr("subprocess.Popen", lambda cmd, **kw: fake_ffmpeg)
