@@ -55,7 +55,11 @@
 # (libnvinfer*, libnvonnx*, libnvinfer_plugin*, trtexec) so net delta is modest.
 # -----------------------------------------------------------------------------
 
-FROM nvidia/cuda:12.6.1-cudnn-runtime-ubuntu24.04
+# NOTE on base choice: cudnn-DEVEL (not -runtime) — first build attempt v0.2.0
+# used -runtime, which omits nvcc + CUDA headers; ffmpeg's `--enable-cuda-nvcc`
+# requires nvcc and vstrt's CMake build needs <cuda_runtime.h>. Devel ships both.
+# Image is ~2 GB larger but that's a Phase-2 size optimization.
+FROM nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04
 
 ARG VS_VERSION=R72
 ARG VSMLRT_VERSION=15.13
@@ -165,11 +169,13 @@ RUN curl -fSL \
         -o /tmp/TensorRT.tar.gz \
     && mkdir -p /opt/tensorrt \
     && tar -xzf /tmp/TensorRT.tar.gz -C /opt/tensorrt --strip-components=1 \
+    # libnvinfer* covers nvinfer, nvinfer_plugin, nvinfer_dispatch, nvinfer_lean,
+    # nvinfer_vc_plugin. libnvonnxparser is the .so name in TRT 10.x.
+    # libnvparsers/libnvcaffe_parser were removed after TRT 9.x.
     && cp -d /opt/tensorrt/lib/libnvinfer*.so* /usr/local/lib/ \
-    && cp -d /opt/tensorrt/lib/libnvonnx*.so* /usr/local/lib/ || true \
-    && cp -d /opt/tensorrt/lib/libnvparsers*.so* /usr/local/lib/ || true \
+    && cp -d /opt/tensorrt/lib/libnvonnxparser*.so* /usr/local/lib/ 2>/dev/null || true \
     && cp -r /opt/tensorrt/include/* /usr/local/include/ \
-    && cp /opt/tensorrt/bin/trtexec /usr/local/bin/trtexec || true \
+    && cp /opt/tensorrt/bin/trtexec /usr/local/bin/trtexec 2>/dev/null || true \
     && rm -rf /opt/tensorrt /tmp/TensorRT.tar.gz \
     && ldconfig
 
