@@ -125,3 +125,18 @@ def test_run_rife_clip_build_failure_returns_2(tmp_path, monkeypatch):
     assert result.returncode == 2
     assert "clip build failed" in result.stderr
     assert "RuntimeError" in result.stderr
+
+
+def test_build_ffmpeg_cmd_includes_hls_settings():
+    from run_rife import _build_ffmpeg_cmd
+    cmd = _build_ffmpeg_cmd(
+        playlist=Path("/var/hls/playlist.m3u8"),
+        segment_pattern=Path("/var/hls/segment_%03d.ts"),
+    )
+    assert cmd[0] == "ffmpeg"
+    assert "-c:v" in cmd and cmd[cmd.index("-c:v") + 1] == "h264_nvenc"
+    assert "-hls_time" in cmd and cmd[cmd.index("-hls_time") + 1] == "4"
+    assert "-hls_segment_filename" in cmd
+    assert "-f" in cmd
+    # Trailing arg must be the playlist path (compare as Path to handle OS separators).
+    assert Path(cmd[-1]) == Path("/var/hls/playlist.m3u8")

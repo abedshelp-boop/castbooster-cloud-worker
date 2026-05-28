@@ -64,6 +64,32 @@ def _build_clip(source_url: str):
     return out
 
 
+def _build_ffmpeg_cmd(playlist: Path, segment_pattern: Path) -> list[str]:
+    """Build the ffmpeg argv for NVENC h264 + HLS muxer.
+
+    Extracted from run_rife() so the keyframe / GOP / bitrate args are
+    unit-testable without spawning a real ffmpeg subprocess.
+    """
+    return [
+        "ffmpeg", "-y",
+        "-f", "yuv4mpegpipe",
+        "-i", "-",
+        "-c:v", "h264_nvenc",
+        "-preset", "p4",
+        "-tune", "ll",
+        "-b:v", "8M",
+        "-maxrate", "12M",
+        "-bufsize", "16M",
+        "-pix_fmt", "yuv420p",
+        "-f", "hls",
+        "-hls_time", "4",
+        "-hls_list_size", "6",
+        "-hls_flags", "delete_segments+independent_segments",
+        "-hls_segment_filename", str(segment_pattern),
+        str(playlist),
+    ]
+
+
 def run_rife(
     source_url: str,
     output_dir: Path,
@@ -117,24 +143,7 @@ def run_rife(
         )
 
     # Build the ffmpeg command — reads y4m from stdin, encodes via NVENC, HLS-muxes
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "yuv4mpegpipe",
-        "-i", "-",
-        "-c:v", "h264_nvenc",
-        "-preset", "p4",
-        "-tune", "ll",
-        "-b:v", "8M",
-        "-maxrate", "12M",
-        "-bufsize", "16M",
-        "-pix_fmt", "yuv420p",
-        "-f", "hls",
-        "-hls_time", "4",
-        "-hls_list_size", "6",
-        "-hls_flags", "delete_segments+independent_segments",
-        "-hls_segment_filename", str(segment_pattern),
-        str(playlist),
-    ]
+    ffmpeg_cmd = _build_ffmpeg_cmd(playlist, segment_pattern)
     print(f"[run_rife] Spawning ffmpeg: {' '.join(ffmpeg_cmd[:6])} ...", flush=True)
 
     # Start ffmpeg, pipe clip.output() into its stdin
