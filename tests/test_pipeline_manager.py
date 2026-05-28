@@ -70,3 +70,25 @@ def test_completion_rc_zero_transitions_to_completed(tmp_path):
     assert s["pipeline_returncode"] == 0
     assert s["error_type"] is None
     assert s["error_msg"] is None
+
+
+def test_completion_rc_nonzero_transitions_to_failed(tmp_path):
+    from pipeline_types import PipelineResult
+
+    def fake_pipeline(**kwargs):
+        return PipelineResult(returncode=2, stdout="", stderr="clip build failed: bs.VideoSource Couldn't open URL")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    m.start(source_url="https://bad.m3u8", headers=None)
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+    s = m.status()
+    assert s["state"] == "failed"
+    assert s["pipeline_returncode"] == 2
+    assert s["error_type"] == "PipelineNonZeroExit"
+    assert "returncode=2" in s["error_msg"]
+    assert "Couldn't open URL" in s["stderr_tail"]

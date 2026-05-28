@@ -182,8 +182,11 @@ class PipelineManager:
             # in Task 4 can be added and we keep TDD discipline.
             raise
         with self._lock:
-            # Tier-0 guard: only transition if state is still RUNNING.
             if self._state is PipelineState.RUNNING:
                 self._result = result
                 if result.returncode == 0:
                     self._state = PipelineState.COMPLETED
+                else:
+                    self._state = PipelineState.FAILED
+                    self._error_type = "PipelineNonZeroExit"
+                    self._error_msg = f"returncode={result.returncode}"
