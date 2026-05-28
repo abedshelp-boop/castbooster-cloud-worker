@@ -62,6 +62,10 @@ class PipelineManager:
         # Lazy-defaulted so tests can inject without importing run_rife
         # (which transitively imports vapoursynth, only present on the pod).
         self._run_pipeline = run_pipeline
+        # Per-run terminal callback — fires exactly once on COMPLETED /
+        # FAILED. Used by server.py to unregister the source-proxy token
+        # without coupling PipelineManager to the SourceRegistry module.
+        self._on_terminal: Callable[[], None] | None = None
 
     def _hls_url(self) -> str:
         return f"{self._public_base_url}/hls/playlist.m3u8" if self._public_base_url else ""
@@ -110,7 +114,13 @@ class PipelineManager:
         self,
         source_url: str,
         headers: dict[str, str] | None,
+        on_terminal: Callable[[], None] | None = None,
     ) -> StartOutcome:
+        """Spawn a pipeline thread. `on_terminal`, if provided, is invoked
+        exactly once when the pipeline transitions to COMPLETED or FAILED
+        (including the ConfigurationError + worker-thread-raised paths).
+        It's best-effort: a callback exception is logged and swallowed so
+        a buggy cleanup hook can't leak the manager into a stuck state."""
         with self._lock:
             if self._state is PipelineState.RUNNING:
                 return StartOutcome.already_running(self._snapshot_locked())
@@ -124,6 +134,7 @@ class PipelineManager:
             self._state = PipelineState.RUNNING
             self._source_url = source_url
             self._started_at = time.time()
+            self._on_terminal = on_terminal
             self._thread = threading.Thread(
                 target=self._run_target,
                 args=(source_url, headers),
@@ -187,6 +198,7 @@ class PipelineManager:
                     self._state = PipelineState.FAILED
                     self._error_type = "ConfigurationError"
                     self._error_msg = "run_pipeline callable was not configured"
+            self._fire_terminal_callback()
             return
         try:
             result = run(
@@ -201,6 +213,7 @@ class PipelineManager:
                     self._error_type = type(exc).__name__
                     self._error_msg = str(exc)[:1500]
                     self._traceback = traceback.format_exc()[-2000:]
+            self._fire_terminal_callback()
             return
         with self._lock:
             if self._state is PipelineState.RUNNING:
@@ -211,3 +224,24 @@ class PipelineManager:
                     self._state = PipelineState.FAILED
                     self._error_type = "PipelineNonZeroExit"
                     self._error_msg = f"returncode={result.returncode}"
+        self._fire_terminal_callback()
+
+    def _fire_terminal_callback(self) -> None:
+        """Invoke + clear the on_terminal hook. Best-effort: a callback
+        exception must not propagate out of the worker thread, since the
+        thread is already past its terminal state transition and Python's
+        default unhandled-exception handler would just print to stderr."""
+        with self._lock:
+            cb = self._on_terminal
+            self._on_terminal = None
+        if cb is None:
+            return
+        try:
+            cb()
+        except BaseException as e:
+            # Print but never re-raise; pipeline is already terminal.
+            print(
+                f"[pipeline_manager] on_terminal callback failed: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
