@@ -49,3 +49,24 @@ def test_start_transitions_to_running_immediately(tmp_path):
     assert s["elapsed_s"] is not None and s["elapsed_s"] >= 0
     block.set()  # unblock the fake worker
     m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+
+def test_completion_rc_zero_transitions_to_completed(tmp_path):
+    from pipeline_types import PipelineResult
+
+    def fake_pipeline(**kwargs):
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    m.start(source_url="https://test.m3u8", headers=None)
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+    s = m.status()
+    assert s["state"] == "completed"
+    assert s["pipeline_returncode"] == 0
+    assert s["error_type"] is None
+    assert s["error_msg"] is None

@@ -161,13 +161,29 @@ class PipelineManager:
         self._traceback = None
 
     def _run_target(self, source_url: str, headers: dict[str, str] | None) -> None:
-        # Stub for now — actual transitions land in Task 3.
-        # The fake pipeline injected by tests will keep the thread alive
-        # until block.set(), then exit cleanly.
         run = self._run_pipeline
         if run is None:
+            # No pipeline injected (test misconfiguration or production bug).
+            # Treat as failure rather than leave state in RUNNING forever.
+            with self._lock:
+                if self._state is PipelineState.RUNNING:
+                    self._state = PipelineState.FAILED
+                    self._error_type = "ConfigurationError"
+                    self._error_msg = "run_pipeline callable was not configured"
             return
         try:
-            run(source_url=source_url, output_dir=self._output_dir, extra_input_headers=headers)
-        except BaseException:
-            pass
+            result = run(
+                source_url=source_url,
+                output_dir=self._output_dir,
+                extra_input_headers=headers,
+            )
+        except BaseException as exc:
+            # Exception path lands in Task 5 — for now, re-raise so the test
+            # in Task 4 can be added and we keep TDD discipline.
+            raise
+        with self._lock:
+            # Tier-0 guard: only transition if state is still RUNNING.
+            if self._state is PipelineState.RUNNING:
+                self._result = result
+                if result.returncode == 0:
+                    self._state = PipelineState.COMPLETED
