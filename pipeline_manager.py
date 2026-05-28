@@ -114,7 +114,10 @@ class PipelineManager:
         with self._lock:
             if self._state is PipelineState.RUNNING:
                 return StartOutcome.already_running(self._snapshot_locked())
-            # Reset transient fields. Auto-wipe handled in Task 7.
+            # From a terminal state, wipe so a stale playlist/segments from
+            # the previous pipeline don't leak into the new run.
+            if self._state in (PipelineState.COMPLETED, PipelineState.FAILED):
+                self._wipe_output_dir_locked()
             self._reset_fields_locked()
             # Tier-0 invariant: transition BEFORE thread.start so the worker
             # never sees IDLE/COMPLETED/FAILED on its first lock acquire.
@@ -159,6 +162,20 @@ class PipelineManager:
         self._error_type = None
         self._error_msg = None
         self._traceback = None
+
+    def _wipe_output_dir_locked(self) -> None:
+        """Remove segment_*.ts files + playlist.m3u8 from output_dir, but
+        preserve the directory itself (nginx is serving it). Best-effort —
+        a stray file we can't delete shouldn't block a new pipeline.
+        """
+        if not self._output_dir.exists():
+            return
+        for p in self._output_dir.iterdir():
+            if p.is_file() and (p.name.startswith("segment_") or p.name == "playlist.m3u8"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
     def _run_target(self, source_url: str, headers: dict[str, str] | None) -> None:
         run = self._run_pipeline

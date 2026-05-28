@@ -139,3 +139,76 @@ def test_second_start_while_running_returns_already_running(tmp_path):
 
     block.set()
     m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+
+def test_start_after_completed_wipes_output_dir(tmp_path):
+    from pipeline_types import PipelineResult
+
+    # First run: completes successfully
+    def fake_completes(**kwargs):
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_completes,
+    )
+    m.start(source_url="https://first.m3u8", headers=None)
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+    assert m.status()["state"] == "completed"
+
+    # Plant a stale segment + playlist that the next start() must wipe.
+    (tmp_path / "segment_007.ts").write_bytes(b"stale" * 1000)
+    (tmp_path / "playlist.m3u8").write_text("#EXTM3U\nstale\n")
+
+    # Second start: from a fresh (un-blocked) callable so we can observe RUNNING.
+    block = threading.Event()
+
+    def fake_blocks(**kwargs):
+        block.wait(timeout=5)
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m._run_pipeline = fake_blocks  # type: ignore[attr-defined]
+    m.start(source_url="https://second.m3u8", headers=None)
+    s = m.status()
+    assert s["state"] == "running"
+    assert not (tmp_path / "segment_007.ts").exists(), "stale segment must be wiped"
+    assert not (tmp_path / "playlist.m3u8").exists(), "stale playlist must be wiped"
+
+    block.set()
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+
+def test_start_after_failed_wipes_output_dir(tmp_path):
+    from pipeline_types import PipelineResult
+
+    def fake_fails(**kwargs):
+        return PipelineResult(returncode=2, stdout="", stderr="failed")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_fails,
+    )
+    m.start(source_url="https://first.m3u8", headers=None)
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+    assert m.status()["state"] == "failed"
+
+    (tmp_path / "segment_003.ts").write_bytes(b"stale" * 1000)
+
+    block = threading.Event()
+
+    def fake_blocks(**kwargs):
+        block.wait(timeout=5)
+        return PipelineResult(returncode=0, stdout="", stderr="")
+
+    m._run_pipeline = fake_blocks  # type: ignore[attr-defined]
+    m.start(source_url="https://second.m3u8", headers=None)
+    assert m.status()["state"] == "running"
+    assert not (tmp_path / "segment_003.ts").exists()
+    # Error fields must reset on restart
+    assert m.status()["error_type"] is None
+    assert m.status()["error_msg"] is None
+
+    block.set()
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
