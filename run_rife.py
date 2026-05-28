@@ -32,6 +32,19 @@ def _build_clip(source_url: str):
     src = core.bs.VideoSource(source=source_url, cachemode=0)
     src = core.resize.Bilinear(src, format=vs.RGBS, matrix_in_s='709')
 
+    # v0.2.6: pad source dims up to a multiple of 32. RIFE's TRT engine requires
+    # input height/width divisible by 32; without this, vsmlrt raises:
+    #   ValueError: vsmlrt.RIFEMerge: tile size must be divisible by 32 (W, H)
+    # at clip-build time (caught upstream, but the partial-graph teardown then
+    # segfaults VS → uvicorn restart loop fires → /process returns CF 502).
+    # The /probe/rife_eval_url endpoint already does this; pulling the same
+    # logic in here so /process works end-to-end. We pad on the right/bottom
+    # so the visible frame stays in the top-left, then crop back after RIFE.
+    pad_w = (32 - src.width % 32) % 32
+    pad_h = (32 - src.height % 32) % 32
+    if pad_w or pad_h:
+        src = core.std.AddBorders(src, right=pad_w, bottom=pad_h)
+
     # RIFE 2x temporal upsample (30fps source -> 60fps output)
     out = RIFE(
         src,
@@ -39,6 +52,12 @@ def _build_clip(source_url: str):
         model=46,  # RIFE v4.6
         backend=Backend.TRT(fp16=True, num_streams=2),
     )
+
+    # v0.2.6: crop the RIFE output back to original dimensions so the final
+    # HLS stream matches the source aspect (NVENC encodes whatever we hand it,
+    # so a 1280x736 padded frame would leak black borders downstream).
+    if pad_w or pad_h:
+        out = core.std.Crop(out, right=pad_w, bottom=pad_h)
 
     # Convert back to YUV420P8 for NVENC
     out = core.resize.Bilinear(out, format=vs.YUV420P8, matrix_s='709')

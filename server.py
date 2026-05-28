@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.2.5")
+app = FastAPI(title="castbooster-cloud-worker", version="0.2.6")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
