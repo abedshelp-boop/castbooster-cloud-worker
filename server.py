@@ -290,78 +290,73 @@ def run_pipeline_for_request(**kwargs) -> PipelineResult:
 
 @app.post("/process", dependencies=[Depends(require_api_key)])
 def process(req: ProcessRequest):
-    import traceback as _tb
-    # Log to BOTH stdout and stderr — v0.1.5 had only stderr and we never saw it
-    # in RunPod web UI logs. Mirror to stdout too.
+    """Spawn the RIFE+NVENC pipeline in a background thread; return the
+    predicted HLS URL within ~1s. Errors after spawn surface via
+    /process_status as state="failed".
+
+    Pre-flight (synchronous) validation:
+      - PUBLIC_BASE_URL must be set (500 if not).
+      - CRLF in source_headers raises ValueError -> 400.
+      - extra_input_headers not yet supported -> NotImplementedError -> 400.
+    """
     _log("/process ENTER", source_url=req.source_url[:200])
-    print(f"[/process] ENTER source_url={req.source_url[:200]}", file=sys.stderr, flush=True)
-
-    out_dir = _hls_dir()
     base = _public_base_url()
-    print(f"[/process] out_dir={out_dir} base={base}", file=sys.stderr, flush=True)
-
-    # v0.1.15: ALL error paths in /process now use JSONResponse instead of
-    # HTTPException. v0.1.11 swapped 400/502 only and left the 500 as
-    # HTTPException — but the multi-KB tracebacks we surface here (and the
-    # observation that Cloudflare emits a static 502 page when any HTTPException
-    # body exceeds some internal threshold) make a clean sweep the safer call.
-    # Auth (require_api_key dependency) still uses HTTPException — that's
-    # the right primitive for short auth-failure bodies.
     if not base:
-        print(f"[/process] ABORT: PUBLIC_BASE_URL not configured", file=sys.stderr, flush=True)
         return JSONResponse(
             status_code=500,
             content={"error": "PUBLIC_BASE_URL not configured"},
         )
 
-    try:
-        print(f"[/process] Calling run_pipeline_for_request...", file=sys.stderr, flush=True)
-        result = run_pipeline_for_request(
-            source_url=req.source_url,
-            output_dir=out_dir,
-            extra_input_headers=req.source_headers or None,
-        )
-        print(f"[/process] pipeline returned: returncode={result.returncode} stderr_tail={result.stderr[-200:]!r}", file=sys.stderr, flush=True)
-    except (ValueError, NotImplementedError) as e:
-        # v0.1.15: pure JSONResponse, drop "detail" key. The shape now matches
-        # the probe endpoints (error_type + error_msg). Tests assert on those.
-        print(f"[/process] 400 invalid request: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    # Pre-flight validation that has to happen synchronously so the client
+    # gets 400 immediately (not buried inside an async FAILED status).
+    # Replicates the guard from run_rife.py without importing it.
+    headers = req.source_headers or {}
+    for k, v in headers.items():
+        if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error_type": "ValueError",
+                    "error_msg": f"header {k!r} contains CR/LF (injection attempt)",
+                },
+            )
+    if headers:
+        # run_rife still raises NotImplementedError for non-empty headers
+        # (vapoursynth source doesn't accept them yet).
         return JSONResponse(
             status_code=400,
             content={
-                "error_type": type(e).__name__,
-                "error_msg": str(e)[:1500],
-            },
-        )
-    except BaseException as e:
-        # v0.1.15: catch BaseException (not just Exception) so KeyboardInterrupt,
-        # SystemExit, and native-libs-style BaseException raises still surface as
-        # JSON instead of bringing down uvicorn.
-        tb_tail = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-2000:]
-        print(f"[/process] 502 pipeline EXCEPTION: {type(e).__name__}: {e}\n{tb_tail}", file=sys.stderr, flush=True)
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": type(e).__name__,
-                "error_msg": str(e)[:1500],
-                "traceback_tail": tb_tail,
+                "error_type": "NotImplementedError",
+                "error_msg": (
+                    "extra_input_headers not supported in RIFE pipeline yet — "
+                    "vapoursynth/bs reads the source, not ffmpeg. "
+                    "Phase 2: thread headers via bs format_opts."
+                ),
             },
         )
 
-    if result.returncode != 0:
-        print(f"[/process] 502 pipeline nonzero: rc={result.returncode}", file=sys.stderr, flush=True)
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "pipeline returncode nonzero",
-                "returncode": result.returncode,
-                "stderr_tail": result.stderr[-1500:] if result.stderr else "",
-            },
-        )
-
-    hls_url = f"{base.rstrip('/')}/hls/playlist.m3u8"
-    print(f"[/process] 200 SUCCESS hls_url={hls_url}", file=sys.stderr, flush=True)
-    return {"hls_url": hls_url}
+    mgr: PipelineManager = app.state.pipeline_manager
+    outcome = mgr.start(source_url=req.source_url, headers=None)
+    if outcome.success:
+        # Return only the public fields (drop "traceback" since it's null here).
+        snap = outcome.snapshot
+        return {
+            "hls_url": snap["hls_url"],
+            "state": snap["state"],
+            "started_at": snap["started_at"],
+            "source_url": snap["source_url"],
+        }
+    # Already running -> 409 with current snapshot.
+    snap = outcome.snapshot
+    return JSONResponse(
+        status_code=409,
+        content={
+            "state": snap["state"],
+            "hls_url": snap["hls_url"],
+            "source_url": snap["source_url"],
+            "started_at": snap["started_at"],
+        },
+    )
 
 
 @app.post("/stop", dependencies=[Depends(require_api_key)])
