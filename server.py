@@ -13,7 +13,7 @@ from pipeline_manager import PipelineManager, PipelineState
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.2.8")
+app = FastAPI(title="castbooster-cloud-worker", version="0.3.0")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
