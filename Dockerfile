@@ -198,6 +198,14 @@ RUN curl -fSL \
     && cp -d /opt/tensorrt/lib/libnvonnxparser*.so* /usr/local/lib/ 2>/dev/null || true \
     && cp -r /opt/tensorrt/include/* /usr/local/include/ \
     && cp /opt/tensorrt/bin/trtexec /usr/local/bin/trtexec 2>/dev/null || true \
+    # vsmlrt.py hardcodes trtexec_path = os.path.join(plugins_path, "vsmlrt-cuda", "trtexec")
+    # where plugins_path is the directory containing libvstrt.so. The vstrt plugin
+    # lives at /usr/local/lib/vapoursynth/libvstrt.so, so vsmlrt expects
+    # /usr/local/lib/vapoursynth/vsmlrt-cuda/trtexec. We symlink /usr/local/bin/trtexec
+    # in. (Discovered v0.2.3 pod test: vsmlrt raised FileNotFoundError because
+    # the expected path did not exist even though trtexec was on PATH.)
+    && mkdir -p /usr/local/lib/vapoursynth/vsmlrt-cuda \
+    && ln -sf /usr/local/bin/trtexec /usr/local/lib/vapoursynth/vsmlrt-cuda/trtexec \
     && rm -rf /opt/tensorrt /tmp/TensorRT.tar.gz \
     && ldconfig
 
