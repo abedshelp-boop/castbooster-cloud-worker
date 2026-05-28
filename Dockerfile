@@ -228,19 +228,16 @@ RUN git clone --depth 1 -b ${BESTSOURCE_TAG} --recurse-submodules \
     && rm -rf /tmp/bs
 
 # -----------------------------------------------------------------------------
-# 8. L-SMASH-Works (lsmas) — kept as fallback / diag probe
+# 8. L-SMASH-Works (lsmas) intentionally OMITTED in v0.2.2:
 # -----------------------------------------------------------------------------
-# run_rife.py uses bs.VideoSource now (v0.1.10+) but server.py still exposes
-# /probe/lsmas_real + /probe/lsmas_realize for diagnostics. Cheap to build.
+# 1. run_rife.py uses bs.VideoSource (BestSource), not lsmas.LWLibavSource
+# 2. AkarinVS/L-SMASH-Works' VapourSynth meson build requires liblsmash
+#    pre-installed; the bundled submodule isn't built by the VS subproject
+# 3. Dropping it removes a 5-min build step + simplifies the image
+# 4. /probe/lsmas_* diagnostic endpoints will return "namespace not found"
+#    at runtime — acceptable since the lsmas-can't-do-HTTP bug was already
+#    diagnosed in v0.1.10
 # -----------------------------------------------------------------------------
-RUN git clone --depth 1 --recurse-submodules \
-        https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git /tmp/lsmas \
-    && cd /tmp/lsmas/VapourSynth \
-    && sed -i "/'..\/common\/qsv\.\(c\|h\)',/d" meson.build \
-    && CFLAGS=-fPIC CXXFLAGS=-fPIC LDFLAGS="-Wl,-Bsymbolic" meson setup build \
-    && ninja -C build && ninja -C build install \
-    && ldconfig \
-    && rm -rf /tmp/lsmas
 
 # -----------------------------------------------------------------------------
 # 9. vs-mlrt vstrt plugin (the TensorRT VapourSynth bridge)
