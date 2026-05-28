@@ -35,13 +35,13 @@
 #   - nginx (HLS edge)
 #   - vsmlrt.py Python wrapper module (NOT installed by the base — only libvstrt.so is)
 #   - RIFE v4.6 ONNX model (pruned from vs-mlrt v15.13 models bundle)
-#   - cuda-compat-13-0 (v0.1.14) — CUDA forward-compatibility shim so the
-#     CUDA-13 runtime baked into the styler base can talk to RunPod kernel
-#     drivers that only advertise CUDA-12.x (535/550/575). Without this,
-#     core.trt.DeviceProperties(0) raises "CUDA driver version is insufficient
-#     for CUDA runtime version" on first /process call. See big block before
-#     the install step for the full rationale.
 #   - Our app code + start.sh
+#
+# v0.1.14 attempt (REVERTED in v0.1.15): cuda-compat-13-0 to fix the
+# "driver version insufficient" error on RunPod pods with old host drivers.
+# That layer was REMOVED because NVIDIA's compat libcuda hard-rejects
+# consumer GPUs (Tesla-only). See the v0.1.15 comment block in this file
+# and gotchas/2026-05-28-cuda-compat-tesla-only-gate.md for full detail.
 #
 # Trade-offs / risks:
 #   1. TRT 10.13 in :minimal_no_avx512 vs 10.16 in :minimal. vsmlrt 15.13
@@ -55,9 +55,6 @@
 FROM docker.io/styler00dollar/vsgan_tensorrt:minimal_no_avx512
 
 ARG VSMLRT_VERSION=15.13
-# v0.1.14 — pinned cuda-compat-13-0 version. 580.x line covers CUDA 13.0
-# runtimes; bump alongside the styler base if it advances TRT/CUDA versions.
-ARG CUDA_COMPAT_VERSION=580.159.04-1ubuntu1
 
 # Our app's WORKDIR (overrides base's /workspace/tensorrt)
 WORKDIR /app
@@ -103,54 +100,30 @@ RUN set -eux \
     && echo "[v0.1.8] static binaries installed: nginx + 7zzs"
 
 # -----------------------------------------------------------------------------
-# v0.1.14 — CUDA forward-compatibility shim (`cuda-compat-13-0`)
+# v0.1.15 — CUDA forward-compatibility shim REMOVED
 # -----------------------------------------------------------------------------
-# Problem: the styler base is built on `nvcr.io/nvidia/tensorrt:26.04-py3`,
-# which ships CUDA 13 runtime + TensorRT 10.13. RunPod's pods we land on
-# currently expose driver 535-575 (CUDA 12.x compatible). When we instantiate
-# `core.trt.DeviceProperties(0)` on the pod we hit:
+# History: v0.1.14 introduced `cuda-compat-13-0` to bridge the styler base
+# (CUDA 13 runtime, requires libcuda 580+) to RunPod pods running older host
+# drivers (535-575). On the v0.1.14 acceptance pod the compat libcuda
+# initialized but immediately bailed out with:
 #
-#   CUDA error: driver version is insufficient for CUDA runtime version
+#   vapoursynth.Error: forward compatibility was attempted on non supported HW
 #
-# Mitigation: install NVIDIA's CUDA Forward Compatibility package
-# (`cuda-compat-13-0`). It ships a newer user-mode libcuda.so.580.x plus the
-# nvvm + ptxjit libs into `/usr/local/cuda-13.0/compat/`. When LD_LIBRARY_PATH
-# resolves libcuda.so from the compat dir first, the CUDA-13 runtime sees a
-# matching libcuda ABI (580) which transparently bridges to the older host
-# kernel module (535/550/575). See:
-#   https://docs.nvidia.com/deploy/cuda-compatibility/ (forward-compat section)
-#   https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/ ("CUDA Toolkit Versioning")
+# This is NVIDIA's hard gate in cuda-compat: forward-compat is officially
+# datacenter-only (Tesla). On consumer GPUs (the RTX 4090s RunPod gives us)
+# the compat libcuda detects the GPU class and refuses to initialize. We
+# can't bypass this from userspace.
 #
-# Caveat: NVIDIA officially supports this only on TESLA/datacenter cards. On
-# RTX consumer cards (which RunPod uses for 4090 pods) it usually still works
-# because the user-mode ABI is identical; if a future pod driver is too old
-# it'll fail-fast with a clear error and we can pivot.
+# v0.1.15 strategy: drop cuda-compat entirely and rely on the host driver
+# being new enough on its own. Some RunPod machines DO have driver 580+
+# (especially newer datacenters). If we land on one of those, the styler
+# CUDA-13 runtime works natively. If not, we land back on the original
+# "driver version insufficient" error and we'll pivot to a CUDA-12.x base
+# image build in v0.1.16+.
 #
-# Implementation note: we deliberately avoid `apt-get install` because the
-# styler base (Ubuntu Noble snapshot from 2025-10-30) has a frozen apt state
-# that cascades into libc6/systemd dep conflicts when reached out to live
-# repos (see v0.1.8 commentary above). Instead we curl the .deb file straight
-# from NVIDIA's repo and use `dpkg-deb -x` to extract only its payload —
-# no dpkg DB writes, no apt resolution. The .deb is self-contained: only
-# .so files under /usr/local/cuda-13.0/compat/.
-RUN set -eux \
-    && curl -fsSL -o /tmp/cuda-compat.deb \
-        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-compat-13-0_${CUDA_COMPAT_VERSION}_amd64.deb" \
-    && mkdir -p /tmp/cuda-compat-extract \
-    && dpkg-deb -x /tmp/cuda-compat.deb /tmp/cuda-compat-extract \
-    && mkdir -p /usr/local/cuda-13.0/compat \
-    && cp -av /tmp/cuda-compat-extract/usr/local/cuda-13.0/compat/. /usr/local/cuda-13.0/compat/ \
-    && ln -sfn /usr/local/cuda-13.0/compat /usr/local/cuda/compat \
-    && rm -rf /tmp/cuda-compat.deb /tmp/cuda-compat-extract \
-    && echo "[v0.1.14] cuda-compat-13-0 extracted to /usr/local/cuda-13.0/compat/:" \
-    && ls -la /usr/local/cuda-13.0/compat/ | head -20
-
-# v0.1.14 — prepend compat dir to LD_LIBRARY_PATH so the dynamic linker
-# resolves libcuda.so.1 from the compat shim before the host-injected
-# /usr/local/nvidia/lib/libcuda.so.<host-driver>. RunPod's nvidia-container-
-# toolkit bind-mounts the host driver libs at startup; this env var ensures
-# our compat copy is searched first.
-ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:/usr/local/cuda/compat:${LD_LIBRARY_PATH}
+# Pin retained for documentation:
+#   cuda-compat-13-0_580.159.04-1ubuntu1 — extracted via dpkg-deb from
+#   https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
 
 # Python deps (Python 3.12 + pip already in base image).
 # Base ships pip system-wide; --break-system-packages avoids PEP-668 refusal.

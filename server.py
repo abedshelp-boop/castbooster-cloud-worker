@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.1.14")
+app = FastAPI(title="castbooster-cloud-worker", version="0.1.15")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -299,7 +299,7 @@ def process(req: ProcessRequest):
     base = _public_base_url()
     print(f"[/process] out_dir={out_dir} base={base}", file=sys.stderr, flush=True)
 
-    # v0.1.14: ALL error paths in /process now use JSONResponse instead of
+    # v0.1.15: ALL error paths in /process now use JSONResponse instead of
     # HTTPException. v0.1.11 swapped 400/502 only and left the 500 as
     # HTTPException — but the multi-KB tracebacks we surface here (and the
     # observation that Cloudflare emits a static 502 page when any HTTPException
@@ -322,7 +322,7 @@ def process(req: ProcessRequest):
         )
         print(f"[/process] pipeline returned: returncode={result.returncode} stderr_tail={result.stderr[-200:]!r}", file=sys.stderr, flush=True)
     except (ValueError, NotImplementedError) as e:
-        # v0.1.14: pure JSONResponse, drop "detail" key. The shape now matches
+        # v0.1.15: pure JSONResponse, drop "detail" key. The shape now matches
         # the probe endpoints (error_type + error_msg). Tests assert on those.
         print(f"[/process] 400 invalid request: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return JSONResponse(
@@ -333,7 +333,7 @@ def process(req: ProcessRequest):
             },
         )
     except BaseException as e:
-        # v0.1.14: catch BaseException (not just Exception) so KeyboardInterrupt,
+        # v0.1.15: catch BaseException (not just Exception) so KeyboardInterrupt,
         # SystemExit, and native-libs-style BaseException raises still surface as
         # JSON instead of bringing down uvicorn.
         tb_tail = "".join(_tb.format_exception(type(e), e, e.__traceback__))[-2000:]

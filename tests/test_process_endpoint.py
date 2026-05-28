@@ -54,7 +54,7 @@ def test_process_starts_pipeline_and_returns_hls_url(client, monkeypatch):
 
 
 def test_process_returns_502_on_pipeline_failure(client, monkeypatch):
-    """v0.1.14: response body shape is `{error, returncode, stderr_tail}` (not
+    """v0.1.15: response body shape is `{error, returncode, stderr_tail}` (not
     `{detail}`). The shape now matches probe endpoints — no HTTPException in
     /process anymore (see server.py /process commentary for the why)."""
     def fake_run_passthrough(**kwargs):
@@ -79,7 +79,7 @@ def test_process_returns_400_on_crlf_in_headers(client):
     """CRLF in source_headers must be rejected by the pipeline guard,
     surfaced as 400 (bad input), not 500 (server error).
 
-    v0.1.14: response body has `error_type` + `error_msg` keys (no `detail`).
+    v0.1.15: response body has `error_type` + `error_msg` keys (no `detail`).
     """
     response = client.post(
         "/process",
