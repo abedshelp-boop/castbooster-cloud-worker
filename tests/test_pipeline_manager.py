@@ -265,3 +265,40 @@ def test_playlist_ready_true_once_any_segment_exists(tmp_path):
 
     block.set()
     m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+
+def test_tier0_race_pipeline_fails_before_start_returns(tmp_path):
+    """Regression-canary for the May 20 Pillar 3.3 multi-proc state-mirror
+    race (see claude-code/gotchas/decision-review-log.md).
+
+    The fake pipeline raises IMMEDIATELY on its first call — so the worker
+    thread can transition to FAILED before the test reads state. If anyone
+    refactors start() to set state=RUNNING AFTER thread.start() (the bug
+    shape from 2026-05-20), this test will see state=RUNNING after join
+    and fail.
+
+    Today's design holds the lock through thread.start() and only releases
+    on `with self._lock:` exit, so the worker can't acquire the lock until
+    after start() returns. Once we join, state must be FAILED.
+    """
+    def fake_pipeline(**kwargs):
+        raise RuntimeError("immediate failure simulating native segfault")
+
+    m = PipelineManager(
+        output_dir=tmp_path,
+        public_base_url="https://fake.example",
+        run_pipeline=fake_pipeline,
+    )
+    outcome = m.start(source_url="https://test.m3u8", headers=None)
+    assert outcome.success is True, "start() itself must succeed; failure surfaces via status"
+
+    m._thread.join(timeout=5)  # type: ignore[union-attr]
+
+    s = m.status()
+    assert s["state"] == "failed", (
+        f"Tier-0 invariant violated: state is {s['state']!r}. Did someone "
+        f"add `self._state = RUNNING` AFTER thread.start() returned? The "
+        f"worker already transitioned to FAILED; do not overwrite."
+    )
+    assert s["error_type"] == "RuntimeError"
+    assert "immediate failure" in s["error_msg"]
