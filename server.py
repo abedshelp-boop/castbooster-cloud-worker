@@ -12,8 +12,10 @@ from idle_watcher import IdleWatcher
 from pipeline_manager import PipelineManager, PipelineState
 from pipeline_types import PipelineResult
 from run_rife import run_rife
+from source_proxy import source_proxy
+from source_registry import SourceRegistry
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.3.0")
+app = FastAPI(title="castbooster-cloud-worker", version="0.3.1")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -297,7 +299,11 @@ def process(req: ProcessRequest):
     Pre-flight (synchronous) validation:
       - PUBLIC_BASE_URL must be set (500 if not).
       - CRLF in source_headers raises ValueError -> 400.
-      - extra_input_headers not yet supported -> NotImplementedError -> 400.
+
+    v0.3.1 (Pillar 3.6): non-empty source_headers no longer 400. They get
+    registered with app.state.source_registry, and the pipeline source URL
+    becomes a loopback /source_proxy?token=... URL so BestSource always
+    reads through the header-injecting proxy.
     """
     _log("/process ENTER", source_url=req.source_url[:200])
     base = _public_base_url()
@@ -307,9 +313,10 @@ def process(req: ProcessRequest):
             content={"error": "PUBLIC_BASE_URL not configured"},
         )
 
-    # Pre-flight validation that has to happen synchronously so the client
-    # gets 400 immediately (not buried inside an async FAILED status).
-    # Replicates the guard from run_rife.py without importing it.
+    # CRLF guard — defense-in-depth against header smuggling. Keep
+    # synchronous so the client gets 400 immediately (not buried inside
+    # an async FAILED status). source_proxy stores headers verbatim, so
+    # this must catch malformed input before registration.
     headers = req.source_headers or {}
     for k, v in headers.items():
         if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
@@ -320,25 +327,27 @@ def process(req: ProcessRequest):
                     "error_msg": f"header {k!r} contains CR/LF (injection attempt)",
                 },
             )
-    if headers:
-        # run_rife still raises NotImplementedError for non-empty headers
-        # (vapoursynth source doesn't accept them yet).
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error_type": "NotImplementedError",
-                "error_msg": (
-                    "extra_input_headers not supported in RIFE pipeline yet — "
-                    "vapoursynth/bs reads the source, not ffmpeg. "
-                    "Phase 2: thread headers via bs format_opts."
-                ),
-            },
-        )
+
+    # Always route through the loopback proxy — even for empty headers —
+    # so behavior is uniform across egydead, mux.dev, and clean sources.
+    # The proxy resolves to the original URL when no rewrite is needed,
+    # and adds the PNG-wrapper strip + playlist rewrite path universally.
+    registry: SourceRegistry = app.state.source_registry
+    token = registry.register(req.source_url, headers)
+    local_source_url = f"http://127.0.0.1:8001/source_proxy?token={token}"
 
     mgr: PipelineManager = app.state.pipeline_manager
-    outcome = mgr.start(source_url=req.source_url, headers=None)
+    outcome = mgr.start(
+        source_url=local_source_url,
+        headers=None,  # headers are already injected by the proxy
+        on_terminal=lambda t=token: registry.unregister(t),
+        display_source_url=req.source_url,
+    )
     if outcome.success:
-        # Return only the public fields (drop "traceback" since it's null here).
+        # Return only the public fields (drop "traceback" since it's null
+        # here). The snapshot's source_url is the client-provided URL
+        # (display_source_url), not the internal loopback proxy URL —
+        # see PipelineManager.start() docs.
         snap = outcome.snapshot
         return {
             "hls_url": snap["hls_url"],
@@ -346,7 +355,7 @@ def process(req: ProcessRequest):
             "started_at": snap["started_at"],
             "source_url": snap["source_url"],
         }
-    # Already running -> 409 with current snapshot.
+    # Already running -> 409 with snapshot of the running pipeline.
     snap = outcome.snapshot
     return JSONResponse(
         status_code=409,
@@ -368,6 +377,14 @@ def process_status():
     """
     mgr: PipelineManager = app.state.pipeline_manager
     return mgr.status()
+
+
+# v0.3.1 (Pillar 3.6): in-pod source proxy for header injection. NOT
+# bearer-gated — BestSource on localhost calls this with the loopback URL
+# /process built; the token in the query string IS the capability. Outside
+# 127.0.0.1 the endpoint is firewalled by nginx (only :8080 is exposed
+# publicly; FastAPI binds :8001 on loopback). See source_proxy.py docstring.
+app.add_api_route("/source_proxy", source_proxy, methods=["GET"])
 
 
 @app.post("/stop", dependencies=[Depends(require_api_key)])
@@ -1255,6 +1272,13 @@ def _on_startup():
         run_pipeline=run_pipeline_for_request,
     )
     _log("STARTUP pipeline_manager ready", output_dir=str(_hls_dir()))
+
+    # v0.3.1 (Pillar 3.6): SourceRegistry — token-keyed (source_url, headers)
+    # map used by /source_proxy to inject Cookie/User-Agent/Referer into
+    # BestSource fetches. /process registers an entry per request and wires
+    # an on_terminal cleanup hook so the entry frees on COMPLETED / FAILED.
+    app.state.source_registry = SourceRegistry()
+    _log("STARTUP source_registry ready")
 
     if os.environ.get("DISABLE_IDLE_WATCHER") == "1":
         _log("STARTUP idle_watcher disabled (DISABLE_IDLE_WATCHER=1)")

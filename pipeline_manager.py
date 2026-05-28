@@ -52,7 +52,11 @@ class PipelineManager:
         self._state = PipelineState.IDLE
         self._thread: threading.Thread | None = None
         self._started_at: float | None = None
+        # _source_url is what the pipeline actually feeds BestSource —
+        # the loopback proxy URL in v0.3.1. _display_source_url is what
+        # the client provided and what /process_status surfaces.
         self._source_url: str | None = None
+        self._display_source_url: str | None = None
         self._result: PipelineResult | None = None
         self._error_type: str | None = None
         self._error_msg: str | None = None
@@ -83,7 +87,9 @@ class PipelineManager:
             snapshot = {
                 "state": self._state.value,
                 "hls_url": self._hls_url() or None,
-                "source_url": self._source_url,
+                # Surface the client-provided URL, not the internal loopback
+                # proxy URL — the proxy is implementation detail.
+                "source_url": self._display_source_url,
                 "started_at": self._started_at,
                 "elapsed_s": elapsed,
                 "playlist_ready": False,  # filled below
@@ -115,6 +121,7 @@ class PipelineManager:
         source_url: str,
         headers: dict[str, str] | None,
         on_terminal: Callable[[], None] | None = None,
+        display_source_url: str | None = None,
     ) -> StartOutcome:
         """Spawn a pipeline thread. `on_terminal`, if provided, is invoked
         exactly once when the pipeline transitions to COMPLETED or FAILED
@@ -133,6 +140,7 @@ class PipelineManager:
             # never sees IDLE/COMPLETED/FAILED on its first lock acquire.
             self._state = PipelineState.RUNNING
             self._source_url = source_url
+            self._display_source_url = display_source_url or source_url
             self._started_at = time.time()
             self._on_terminal = on_terminal
             self._thread = threading.Thread(
@@ -150,7 +158,9 @@ class PipelineManager:
         return {
             "state": self._state.value,
             "hls_url": self._hls_url() or None,
-            "source_url": self._source_url,
+            # Surface the client-provided URL, not the internal loopback
+            # proxy URL — the proxy is implementation detail.
+            "source_url": self._display_source_url,
             "started_at": self._started_at,
             "elapsed_s": (time.time() - self._started_at) if self._started_at else None,
             "playlist_ready": False,
