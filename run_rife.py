@@ -81,6 +81,11 @@ def _build_ffmpeg_cmd(playlist: Path, segment_pattern: Path) -> list[str]:
         "-maxrate", "12M",
         "-bufsize", "16M",
         "-pix_fmt", "yuv420p",
+        # Issue 2: force an IDR keyframe every 4 seconds so the HLS muxer
+        # can cut clean 4-second segments. Time-based expression so it
+        # works for any output framerate (RIFE doubles source, so output
+        # is variable: 60fps source -> 120fps; 30fps source -> 60fps).
+        "-force_key_frames", "expr:gte(t,n_forced*4)",
         "-f", "hls",
         "-hls_time", "4",
         "-hls_list_size", "6",

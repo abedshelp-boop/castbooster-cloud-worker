@@ -140,3 +140,27 @@ def test_build_ffmpeg_cmd_includes_hls_settings():
     assert "-f" in cmd
     # Trailing arg must be the playlist path (compare as Path to handle OS separators).
     assert Path(cmd[-1]) == Path("/var/hls/playlist.m3u8")
+
+
+def test_build_ffmpeg_cmd_forces_keyframes_every_4_seconds():
+    """Issue 2 (Pillar 3.6): NVENC default GOP yields one giant HLS segment
+    because the HLS muxer can't cut without keyframes. Force a keyframe
+    every 4 seconds via expression — time-based so it works for any output
+    framerate (60fps source -> 120fps RIFE output, 30fps source -> 60fps
+    output, etc.).
+    """
+    from run_rife import _build_ffmpeg_cmd
+    cmd = _build_ffmpeg_cmd(
+        playlist=Path("/var/hls/playlist.m3u8"),
+        segment_pattern=Path("/var/hls/segment_%03d.ts"),
+    )
+    assert "-force_key_frames" in cmd, (
+        "missing -force_key_frames: NVENC default GOP doesn't align with "
+        "HLS -hls_time 4, causing one giant segment (Issue 2 from "
+        "docs/specs/2026-05-28-async-process-and-keyframe-fix-design.md)"
+    )
+    idx = cmd.index("-force_key_frames")
+    assert cmd[idx + 1] == "expr:gte(t,n_forced*4)", (
+        "expression must be time-based (t in seconds), not frame-count based; "
+        "see spec rationale: -g N is wrong for variable output framerates"
+    )
