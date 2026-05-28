@@ -197,17 +197,42 @@ RUN curl -fSL \
     && cp -d /opt/tensorrt/lib/libnvinfer*.so* /usr/local/lib/ \
     && cp -d /opt/tensorrt/lib/libnvonnxparser*.so* /usr/local/lib/ 2>/dev/null || true \
     && cp -r /opt/tensorrt/include/* /usr/local/include/ \
-    && cp /opt/tensorrt/bin/trtexec /usr/local/bin/trtexec 2>/dev/null || true \
+    # v0.2.5: install the REAL trtexec binary at /usr/local/bin/trtexec.real,
+    # then write a wrapper at /usr/local/bin/trtexec that explicitly sets
+    # LD_LIBRARY_PATH before exec'ing the real binary. Why the wrapper:
+    # vsmlrt.py:2192 launches trtexec via subprocess.run(args, env={...})
+    # where the env dict only contains TRTEXEC_LOG_FILE + CUDA_MODULE_LOADING.
+    # That STRIPS LD_LIBRARY_PATH from the child env, so the Dockerfile-level
+    # `ENV LD_LIBRARY_PATH=...` (set below) is silently invisible to trtexec
+    # when invoked from RIFE engine compilation. The wrapper script re-injects
+    # the lib paths so trtexec can resolve libnvinfer*, libcudnn*, libcudart*
+    # etc. even when the calling process strips env. ldconfig (run below) is a
+    # belt-and-suspenders fallback for the same problem.
+    && cp /opt/tensorrt/bin/trtexec /usr/local/bin/trtexec.real 2>/dev/null || true \
+    && printf '#!/bin/bash\nexport LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:/opt/tensorrt/lib:${LD_LIBRARY_PATH}\nexec /usr/local/bin/trtexec.real "$@"\n' > /usr/local/bin/trtexec \
+    && chmod +x /usr/local/bin/trtexec \
     # vsmlrt.py hardcodes trtexec_path = os.path.join(plugins_path, "vsmlrt-cuda", "trtexec")
     # where plugins_path is the directory containing libvstrt.so. The vstrt plugin
     # lives at /usr/local/lib/vapoursynth/libvstrt.so, so vsmlrt expects
     # /usr/local/lib/vapoursynth/vsmlrt-cuda/trtexec. We symlink /usr/local/bin/trtexec
-    # in. (Discovered v0.2.3 pod test: vsmlrt raised FileNotFoundError because
-    # the expected path did not exist even though trtexec was on PATH.)
+    # (the wrapper) in. (Discovered v0.2.3 pod test: vsmlrt raised FileNotFoundError
+    # because the expected path did not exist even though trtexec was on PATH.)
     && mkdir -p /usr/local/lib/vapoursynth/vsmlrt-cuda \
     && ln -sf /usr/local/bin/trtexec /usr/local/lib/vapoursynth/vsmlrt-cuda/trtexec \
-    && rm -rf /opt/tensorrt /tmp/TensorRT.tar.gz \
+    && rm -rf /tmp/TensorRT.tar.gz \
+    # v0.2.5: KEEP /opt/tensorrt/lib around (we used to rm -rf it). The wrapper's
+    # LD_LIBRARY_PATH includes /opt/tensorrt/lib as the last fallback in case any
+    # TRT plugin lib didn't get cp'd into /usr/local/lib (e.g. libnvinfer_lean
+    # extras). Cost: ~1.5 GB extra image size; acceptable for a diagnostic
+    # version. Strip it back out in v0.2.6 if the wrapper proves unnecessary.
+    && rm -rf /opt/tensorrt/python /opt/tensorrt/data /opt/tensorrt/doc /opt/tensorrt/samples /opt/tensorrt/targets \
     && ldconfig
+
+# v0.2.5: explicit LD_LIBRARY_PATH for any non-vsmlrt caller (e.g. our own
+# /probe/trtexec endpoint runs trtexec via subprocess.run with full os.environ
+# inherited, so this ENV is what it sees). vsmlrt strips env when calling
+# trtexec — see wrapper script comment above for the real fix.
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:/opt/tensorrt/lib
 
 # -----------------------------------------------------------------------------
 # 6. ffmpeg n7.1 with NVENC + NVDEC + OpenSSL

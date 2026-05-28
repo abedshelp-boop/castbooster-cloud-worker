@@ -12,7 +12,7 @@ from idle_watcher import IdleWatcher
 from pipeline_types import PipelineResult
 from run_rife import run_rife
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.1.15")
+app = FastAPI(title="castbooster-cloud-worker", version="0.2.5")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it
@@ -975,6 +975,96 @@ def probe_rife_eval_url(
             "error_msg": str(e)[:1500],
             "traceback": _tb.format_exc()[-2000:],
         }
+
+
+# -----------------------------------------------------------------------------
+# v0.2.5 TRTEXEC DIRECT PROBE — added 2026-05-28. v0.2.4 pod test showed
+# /probe/rife_eval_url?realize=true crashes with:
+#     RuntimeError: trtexec execution fails but no log is found
+# raised by vsmlrt.py:2200 — meaning vsmlrt invoked trtexec and got a non-zero
+# exit, and trtexec didn't write to $TRTEXEC_LOG_FILE. The most likely root
+# cause: trtexec can't resolve its shared libs (libnvinfer / libcudnn /
+# libcudart) because vsmlrt strips LD_LIBRARY_PATH when subprocessing it
+# (vsmlrt.py:2192 passes a minimal env={TRTEXEC_LOG_FILE, CUDA_MODULE_LOADING}).
+#
+# v0.2.5 fixes this two ways:
+#   (1) /usr/local/bin/trtexec is now a bash wrapper that sets LD_LIBRARY_PATH
+#       explicitly before exec'ing /usr/local/bin/trtexec.real
+#   (2) ENV LD_LIBRARY_PATH set in Dockerfile for any non-vsmlrt caller
+#
+# This endpoint runs trtexec directly (with full os.environ) AND runs ldd to
+# show its dynamic-link state. It catches both:
+#   - "the wrapper isn't on PATH" / symlink broken
+#   - "trtexec exists but ldd shows missing libs"
+# Either tells us whether the v0.2.5 fix worked or pinpoints the real issue.
+# -----------------------------------------------------------------------------
+
+def _ldd(binary_path: str):
+    """Run ldd on a binary to see its library dependencies."""
+    import os
+    import subprocess
+    if not os.path.exists(binary_path):
+        return {"error": "binary not found"}
+    try:
+        r = subprocess.run(
+            ["ldd", binary_path], capture_output=True, text=True, timeout=10
+        )
+        return {"returncode": r.returncode, "output": r.stdout[:3000]}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/probe/trtexec", dependencies=[Depends(require_api_key)])
+def probe_trtexec():
+    """Run trtexec --help directly to see what error it produces.
+
+    Helps debug the 'trtexec execution fails but no log is found' bug from
+    vsmlrt.py:2200. Probes both the wrapper path and the real path."""
+    import os
+    import subprocess
+
+    paths_to_try = [
+        "/usr/local/lib/vapoursynth/vsmlrt-cuda/trtexec",  # vsmlrt's expected path (symlink)
+        "/usr/local/bin/trtexec",        # our wrapper (or the real binary pre-v0.2.5)
+        "/usr/local/bin/trtexec.real",   # v0.2.5+ real binary behind the wrapper
+    ]
+
+    results = []
+    for p in paths_to_try:
+        info: dict = {
+            "path": p,
+            "exists": os.path.exists(p),
+            "is_link": os.path.islink(p) if os.path.exists(p) else None,
+        }
+        if info["is_link"]:
+            try:
+                info["link_target"] = os.readlink(p)
+            except Exception as e:
+                info["link_target_error"] = f"{type(e).__name__}: {e}"
+        if info["exists"]:
+            # Try to run it (--help is fast and doesn't need GPU)
+            try:
+                r = subprocess.run(
+                    [p, "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env={**os.environ},  # explicit env (inherits LD_LIBRARY_PATH)
+                )
+                info["returncode"] = r.returncode
+                info["stdout_head"] = r.stdout[:1500]
+                info["stderr_head"] = r.stderr[:1500]
+            except Exception as e:
+                info["error"] = f"{type(e).__name__}: {e}"
+        results.append(info)
+
+    return {
+        "results": results,
+        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+        "PATH": os.environ.get("PATH", ""),
+        "ldd_trtexec_real": _ldd("/usr/local/bin/trtexec.real"),
+        "ldd_trtexec": _ldd("/usr/local/bin/trtexec"),
+    }
 
 
 @app.on_event("startup")
