@@ -15,7 +15,7 @@ from run_rife import run_rife
 from source_proxy import source_proxy
 from source_registry import SourceRegistry
 
-app = FastAPI(title="castbooster-cloud-worker", version="0.3.1")
+app = FastAPI(title="castbooster-cloud-worker", version="0.3.2")
 
 
 # Catch-all error logger: if any unhandled exception escapes a handler, log it

@@ -20,6 +20,16 @@ fi
 
 mkdir -p /var/hls
 
+# v0.3.2: smoke-test server.py imports BEFORE looping uvicorn. Missing modules
+# in v0.3.0/v0.3.1 made uvicorn restart forever silently and nginx return 502 —
+# see 2026-05-29 gotcha. Now: ImportError fails the container fast.
+echo "[start.sh] Smoke-checking server module imports..."
+python3 -c "import server" || {
+    echo "[start.sh] FATAL: server module won't import (see traceback above)" >&2
+    exit 1
+}
+echo "[start.sh] server module imports cleanly."
+
 # v0.1.7: wrap uvicorn in a restart loop so a native crash in /process doesn't
 # take down the whole pod. Without this, a single segfault during clip-build
 # kills uvicorn and the container exits — RunPod restarts the whole container

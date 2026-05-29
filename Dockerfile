@@ -383,7 +383,12 @@ RUN python3 /tmp/trt_engine_builder.py \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-COPY server.py auth.py pipeline.py pipeline_types.py run_rife.py idle_watcher.py start.sh ./
+# v0.3.2: switched from an explicit file list to a *.py wildcard. The prior
+# list silently dropped pipeline_manager.py (added v0.3.0) and source_proxy.py
+# + source_registry.py (added v0.3.1), so server.py imported modules that
+# weren't in the image — uvicorn died with ModuleNotFoundError, start.sh
+# restart loop hid it behind a permanent nginx 502. See 2026-05-29 gotcha.
+COPY *.py start.sh ./
 COPY nginx.conf /etc/nginx/nginx.conf
 
 # RunPod exposes ONE port per pod — nginx terminates :8080, proxies / to
